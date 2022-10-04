@@ -37,7 +37,7 @@ After the searching process, the neural architectures are stored in the director
 To predict with the best searched model
 
 ```shell
-# Perform a prediction task given a dataset ```VT_summer_predict.csv```
+# Perform a prediction task given a dataset VT_summer_predict.csv
 pyIAAS predict -c NASConfig.json -f VT_summer_predict.csv -t RT_Demand -d out_dir -o prediction.csv
 ```
 
