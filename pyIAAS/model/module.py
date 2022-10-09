@@ -1,15 +1,18 @@
 import abc
 import random
+from typing import Any
 
+import torch.autograd as autograd
 import torch
 import torch.nn as nn
 from torch import Tensor
-from torch.nn import init, Module
+from torch.nn import init, Module, Parameter
+from torch.nn import functional as F
 
 from ..utils.logger import get_logger
 
 
-class NasModule:
+class NasModule(nn.Module):
     def __init__(self, cfg, name, input_shape):
         """
         basic module composing neural networks.
@@ -17,6 +20,7 @@ class NasModule:
         :param name: module name
         :param input_shape: input data shape
         """
+        super().__init__()
         self.logger = get_logger('module', cfg.LOG_FILE)
         self.cfg = cfg
         self.input_shape = input_shape  # (channel, feature)
@@ -27,8 +31,11 @@ class NasModule:
         self._module_instance = None  # buffer the instance
         self.current_level = None  # current width level
         self.widen_sample_fn = self.default_sample_strategy
+        # add pruning field
+        if cfg.NASConfig['Pruning']:
+            self.importance_score = None  # importance score matrix
 
-    def __call__(self, x, *args, **kwargs):
+    def forward(self, x):
         return self._module_instance(x)
 
     @property
@@ -290,6 +297,25 @@ class DenseModule(NasModule):
         self.params = {'in_features': in_features,
                        "out_features": self.current_level}
         self.on_param_end(input_shape)
+        # add pruning field
+        if self.cfg.NASConfig['Pruning']:
+            self.importance_score = nn.Parameter(torch.zeros_like(self._module_instance.bias))
+
+    def forward(self, x):
+        if self.cfg.NASConfig['Pruning']:
+            # accumulate importance score of whole row, we use this as importance estimation of output neuron
+            score = self.importance_score
+            weight_mask = ScoreAccumulator.apply(score) # no change
+            # weight_mask = TopKBinarizer.apply(score,1 - self.cfg.NASConfig['PruningRatio'])  # pruning at running
+            bias_mask = weight_mask
+            weight_mask = torch.unsqueeze(weight_mask,1) * torch.ones(self._module_instance.weight.shape[1])
+
+            # weight and bias is not changed but score tensor is attached to the computational graph
+            masked_weight = self._module_instance.weight * weight_mask
+            masked_bias = self._module_instance.bias * bias_mask
+            return F.linear(x, masked_weight, masked_bias)
+        else:
+            return self._module_instance(x)
 
     def identity_module(self, cfg, name, input_shape: tuple):
         if type(name) != str:
@@ -302,6 +328,9 @@ class DenseModule(NasModule):
         module.output_shape = input_shape
         module.params = {'in_features': input_shape[1], 'out_features': input_shape[1]}
         module._module_instance = dense
+        # add pruning field
+        if self.cfg.NASConfig['Pruning']:
+            module.importance_score = nn.Parameter(torch.zeros_like(self._module_instance.bias))
         return module
 
     def get_module_instance(self):
@@ -546,6 +575,63 @@ class LSTMModule(NasModule):
         self._module_instance = new_module_instance
         self.input_shape = (next_level, self.input_shape[1])
         self.params['input_size'] = next_level
+
+
+# this class comes from [Movement Pruning](https://github.com/huggingface/nn_pruning)
+class TopKBinarizer(autograd.Function):
+    """
+    Top-k Binarizer.
+    Computes a binary mask M from a real value matrix S such that `M_{i,j} = 1` if and only if `S_{i,j}`
+    is among the k% highest values of S.
+
+    Implementation is inspired from:
+        https://github.com/allenai/hidden-networks
+        What's hidden in a randomly weighted neural network?
+        Vivek Ramanujan*, Mitchell Wortsman*, Aniruddha Kembhavi, Ali Farhadi, Mohammad Rastegari
+    """
+
+    @staticmethod
+    def forward(ctx, inputs: torch.tensor, threshold: float):
+        """
+        Args:
+            inputs (`torch.FloatTensor`)
+                The input matrix from which the binarizer computes the binary mask.
+            threshold (`float`)
+                The percentage of weights to keep (the rest is pruned).
+                `threshold` is a float between 0 and 1.
+        Returns:
+            mask (`torch.FloatTensor`)
+                Binary matrix of the same size as `inputs` acting as a mask (1 - the associated weight is
+                retained, 0 - the associated weight is pruned).
+        """
+        # Get the subnetwork by sorting the inputs and using the top threshold %
+        mask = inputs.clone()
+        _, idx = inputs.flatten().sort(descending=True)
+        j = int(threshold * inputs.numel())
+
+        # flat_out and mask access the same memory.
+        flat_out = mask.flatten()
+        flat_out[idx[j:]] = 0
+        flat_out[idx[:j]] = 1
+        return mask
+
+    @staticmethod
+    def backward(ctx, gradOutput):
+        return gradOutput, None
+
+
+# Implementation inspired by TopKBinarizer
+class ScoreAccumulator(autograd.Function):
+    """
+    Accumulate importance score while training. Do not change forward data
+    """
+    @staticmethod
+    def forward(ctx,score):
+        return torch.ones_like(score)
+
+    @staticmethod
+    def backward(ctx, gradOutput):
+        return gradOutput, None
 
 
 class NAS_RNN(nn.Module):

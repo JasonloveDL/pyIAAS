@@ -76,7 +76,7 @@ class ModelConfig:
         """
         module_instances = []
         for m in self.modules:
-            module_instances.append(m.get_module_instance())
+            module_instances.append(m)
             module_instances.append(activate())
         output_shape = self.modules[-1].output_shape
         if len(output_shape) > 1:
@@ -260,18 +260,18 @@ class NasModel:
                 # wider the specific network
                 module = model_config.modules[i]
                 mapping_g, scale_g = module.perform_wider_transformation_current()
-                module_instances.append(model_config.modules[i].get_module_instance())
+                module_instances.append(model_config.modules[i])
                 module_instances.append(self.activate())
                 i += 1
                 # modify next module to match current module
                 module = model_config.modules[i]
                 module.perform_wider_transformation_next(mapping_g, scale_g)
-                module_instances.append(model_config.modules[i].get_module_instance())
+                module_instances.append(model_config.modules[i])
                 module_instances.append(self.activate())
 
             else:
                 # inherent from father network
-                module_instances.append(model_config.modules[i].get_module_instance())
+                module_instances.append(model_config.modules[i])
                 module_instances.append(self.activate())
             i += 1
         module_instances = [*module_instances, *model_config.tail_layers]
@@ -299,17 +299,17 @@ class NasModel:
                 # insert layer inside the network
                 input_shape = self.model_config.modules[i].input_shape
                 identity_module = self.model_config.modules[i].identity_module(self.cfg, insert_type, input_shape)
-                module_instances.append(identity_module.get_module_instance())
+                module_instances.append(identity_module)
                 module_instances.append(self.activate())
 
-            module_instances.append(model_config.modules[i].get_module_instance())
+            module_instances.append(model_config.modules[i])
             module_instances.append(self.activate())
 
         # insert in tail
         if insert_index == module_length:
             input_shape = self.model_config.modules[-1].output_shape
             identity_module = self.model_config.modules[i].identity_module(self.cfg, insert_type, input_shape)
-            module_instances.append(identity_module.get_module_instance())
+            module_instances.append(identity_module)
             module_instances.append(self.activate())
         model_config.modules.insert(insert_index, identity_module)
 

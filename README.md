@@ -121,6 +121,8 @@ The meaning of each term:
 - NetPoolSize : size of the net pool
 - BATCH_SIZE : batch size used in the training process
 - EPISODE : searching times of the reinforcement learning actors
+- Pruning : enable pruning functionality during search (Pruning implementation inspired by [Movement Pruning](https://github.com/huggingface/nn_pruning))
+- PruningRatio : pruning ratio(topV strategy used here)
 - GPU : use GPU or not; if true, the environment should use the GPU version of PyTorch
 - OUT_DIR : output directory
 - Modules : module information 
