@@ -9,7 +9,7 @@ import torch.nn
 from torch.utils.data.dataloader import *
 from torch.utils.data.dataset import TensorDataset
 
-from .module import NasModule, generate_from_skeleton
+from .module import NasModule, generate_from_skeleton, TopK
 from ..utils.logger import get_logger
 from ..utils.sql_connector import get_total_model_count, insert_new_model_config, get_prev_record, \
     insert_new_train_result
@@ -385,6 +385,38 @@ class NasModel:
         pd.DataFrame(self.loss_list).to_csv(loss_path)
         self.transformation_record.to_csv(model_transformation_path)
         insert_new_train_result(self.cfg, self.index, self.train_times, self.test_loss_best)
+
+    def prune(self):
+        """
+        Prune structure by importance score.
+        """
+        # get all modules' importance score
+        modules = self.model_config.modules
+        prune_list = self.model_config.widenable_list
+        score_list = []
+        for i in range(len(prune_list)):
+            if prune_list[i]:
+                score_list.append(modules[i].importance_score)
+        neuron_scores = torch.cat(score_list)
+        # globally prune neurons
+        mask = TopK.apply(neuron_scores, 1 - self.cfg.NASConfig['PruningRatio'])
+        pointer = 0
+        mask_list = []
+        for i in range(len(score_list)):
+            mask_list.append(mask[pointer:pointer + score_list[i].shape[0]])
+            pointer += score_list[i].shape[0]
+
+        # use prune mask to prune each layer
+        pointer = 0
+        for i in range(len(prune_list)):
+            if prune_list[i]:
+                modules[i].perform_prune_current(mask_list[pointer])
+                modules[i + 1].perform_prune_next(mask_list[pointer])
+                pointer += 1
+
+
+
+
 
     def _get_loss_function(self):
         return self.rmse

@@ -30,8 +30,13 @@ class MyTestCase(unittest.TestCase):
         feature_shape = data[0].shape[1:]
         X_train, y_train, X_test, y_test = data
         model_raw = generate_new_model_config(cfg, feature_shape, 1, skeleton).generate_model()
-        model_raw.train(X_train, y_train)
-
-
-
-
+        for i in range(5):
+            model_raw.train(X_train, y_train)
+            loss_prev = model_raw.test(X_test, y_test)
+            print('\n')
+            print(f'prune iteration {i}')
+            print(f'before pruning: {model_raw}')
+            model_raw.prune()
+            loss_after =  model_raw.test(X_test, y_test)
+            print(f'after pruning: {model_raw}')
+            print(f'\nbefore prune:{loss_prev}\t after prune:{loss_after}')

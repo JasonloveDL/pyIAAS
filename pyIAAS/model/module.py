@@ -129,6 +129,22 @@ class NasModule(nn.Module):
         """
         pass
 
+    @abc.abstractmethod
+    def perform_prune_current(self, mask):
+        """
+        prune module in current layer, implement this method in each submodule
+        :return: module of next level
+        """
+        pass
+
+    @abc.abstractmethod
+    def perform_prune_next(self, mask):
+        """
+        prune module follow previous layer, implement this method in each submodule
+        :return: module of next level
+        """
+        pass
+
     @staticmethod
     def default_sample_strategy(original_size, new_size):
         """
@@ -274,6 +290,38 @@ class RNNModule(NasModule):
 
 
 class DenseModule(NasModule):
+    def perform_prune_current(self, mask):
+        """
+        prune dense layer by row, inplace operation
+        :param mask: mask of pruning, should be equal to row of weight
+        :return: None
+        """
+
+        weight = nn.Parameter(self._module_instance.weight[mask])
+        bias = nn.Parameter(self._module_instance.bias[mask])
+        self.current_level = weight.shape[0]
+        new_module_instance = nn.Linear(self.params['in_features'], self.current_level)
+        new_module_instance.bias = bias
+        new_module_instance.weight = weight
+
+        # assigning new attribute
+        self._module_instance = new_module_instance
+        self.output_shape = (self.output_shape[0], self.current_level)
+        self.params['out_features'] = self.current_level
+        self.importance_score = nn.Parameter(self.importance_score[mask])
+
+
+    def perform_prune_next(self, mask):
+        weight = nn.Parameter(self._module_instance.weight[:, mask])
+        self.params['in_features'] = weight.shape[1]
+        new_module_instance = nn.Linear(self.params['in_features'], self.current_level)
+        new_module_instance.weight = weight
+
+        # assigning new attribute todo test this
+        self._module_instance = new_module_instance
+        self.input_shape = (self.input_shape[0], self.params['in_features'])
+
+
     @property
     def is_max_level(self):
         out_range = self.cfg.modulesConfig['dense']['out_range']
@@ -305,10 +353,10 @@ class DenseModule(NasModule):
         if self.cfg.NASConfig['Pruning']:
             # accumulate importance score of whole row, we use this as importance estimation of output neuron
             score = self.importance_score
-            weight_mask = ScoreAccumulator.apply(score) # no change
+            weight_mask = ScoreAccumulator.apply(score)  # no change
             # weight_mask = TopKBinarizer.apply(score,1 - self.cfg.NASConfig['PruningRatio'])  # pruning at running
             bias_mask = weight_mask
-            weight_mask = torch.unsqueeze(weight_mask,1) * torch.ones(self._module_instance.weight.shape[1])
+            weight_mask = torch.unsqueeze(weight_mask, 1) * torch.ones(self._module_instance.weight.shape[1])
 
             # weight and bias is not changed but score tensor is attached to the computational graph
             masked_weight = self._module_instance.weight * weight_mask
@@ -355,6 +403,7 @@ class DenseModule(NasModule):
         self._module_instance = new_module_instance
         self.output_shape = (self.output_shape[0], self.current_level)
         self.params['out_features'] = self.current_level
+        # todo finish wider importance score
         return mapping_g, scale_g
 
     def perform_wider_transformation_next(self, mapping_g: list, scale_g: list):
@@ -578,7 +627,7 @@ class LSTMModule(NasModule):
 
 
 # this class comes from [Movement Pruning](https://github.com/huggingface/nn_pruning)
-class TopKBinarizer(autograd.Function):
+class TopK(autograd.Function):
     """
     Top-k Binarizer.
     Computes a binary mask M from a real value matrix S such that `M_{i,j} = 1` if and only if `S_{i,j}`
@@ -613,7 +662,7 @@ class TopKBinarizer(autograd.Function):
         flat_out = mask.flatten()
         flat_out[idx[j:]] = 0
         flat_out[idx[:j]] = 1
-        return mask
+        return mask == 1
 
     @staticmethod
     def backward(ctx, gradOutput):
@@ -625,8 +674,9 @@ class ScoreAccumulator(autograd.Function):
     """
     Accumulate importance score while training. Do not change forward data
     """
+
     @staticmethod
-    def forward(ctx,score):
+    def forward(ctx, score):
         return torch.ones_like(score)
 
     @staticmethod
