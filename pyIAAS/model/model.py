@@ -163,7 +163,7 @@ class NasModel:
 
     def update_global_information(self):
         """
-        update information in SQLite.
+        update information in SQLite. todo handle pruning operation
         """
         global total_model_count
         if total_model_count is None:
@@ -413,6 +413,9 @@ class NasModel:
                 modules[i].perform_prune_current(mask_list[pointer])
                 modules[i + 1].perform_prune_next(mask_list[pointer])
                 pointer += 1
+
+
+
 
 
 

@@ -35,9 +35,6 @@ class NasModule(nn.Module):
         if cfg.NASConfig['Pruning']:
             self.importance_score = None  # importance score matrix
 
-    def forward(self, x):
-        return self._module_instance(x)
-
     @property
     @abc.abstractmethod
     def is_max_level(self):
@@ -69,6 +66,9 @@ class NasModule(nn.Module):
         :return: None
         """
         pass
+
+    def forward(self, x):
+        return self._module_instance(x)
 
     def on_param_end(self, input_shape):
         """
@@ -146,6 +146,17 @@ class NasModule(nn.Module):
         pass
 
     @staticmethod
+    def mask_sanity_check(mask):
+        """
+        check if mask makes all neuron deleted, if so, randomly keep 1 neuron to keep network
+        work properely
+        """
+        if mask.any():
+            return
+        mask[torch.randint(mask.shape[0], (1,))] = True
+        assert mask.any()  # keep at least one neuron
+
+    @staticmethod
     def default_sample_strategy(original_size, new_size):
         """
         default sample strategy described in paper
@@ -194,6 +205,68 @@ class RNNModule(NasModule):
         self.input_shape = tuple(self.input_shape)
         self.output_shape = tuple(self.output_shape)
         self.on_param_end(input_shape)
+        # add pruning field
+        if self.cfg.NASConfig['Pruning']:
+            def score_accumulate_hook(module, grad_input, grad_output):
+                with torch.enable_grad():
+                    parameter_dict = dict(self._module_instance.rnn_unit.named_parameters())
+                    weight_mask = ScoreAccumulator.apply(self.importance_score)
+                    #
+                    # # manually calculate importance score
+                    # weight_ih_l0 = \
+                    #     parameter_dict['weight_ih_l0'] * torch.unsqueeze(weight_mask, 1)
+                    # weight_hh_l0 = \
+                    #     parameter_dict['weight_hh_l0'] * torch.unsqueeze(weight_mask, 0) * torch.unsqueeze(weight_mask, 1)
+                    # bias_ih_l0 = \
+                    #     parameter_dict['bias_ih_l0'] * weight_mask
+                    # bias_hh_l0 = \
+                    #     parameter_dict['bias_hh_l0'] * weight_mask
+                    #
+                    # # backward
+                    # weight_ih_l0.backward(parameter_dict['weight_ih_l0'].grad)
+                    # weight_hh_l0.backward(parameter_dict['weight_hh_l0'].grad)
+                    # bias_ih_l0.backward(parameter_dict['bias_ih_l0'].grad)
+                    # bias_hh_l0.backward(parameter_dict['bias_hh_l0'].grad)
+
+            def accumulate_importance(score):
+                if self.importance_score.grad is None:
+                    self.importance_score.grad = score
+                else:
+                    self.importance_score.grad += score
+
+            def weight_ih_hook(grad):
+                grad_calculated = torch.sum(self._module_instance.rnn_unit.weight_ih_l0 * grad, 1)
+                accumulate_importance(grad_calculated)
+                return grad
+
+            def weight_hh_hook(grad):
+                grad_calculated = self._module_instance.rnn_unit.weight_hh_l0 * grad
+                grad_calculated = torch.sum(grad_calculated, 0) + torch.sum(grad_calculated, 1)
+                accumulate_importance(grad_calculated)
+                return grad
+
+            def bias_ih_hook(grad):
+                grad_calculated = self._module_instance.rnn_unit.bias_ih_l0 * grad
+                accumulate_importance(grad_calculated)
+                return grad
+
+            def bias_hh_hook(grad):
+                grad_calculated = self._module_instance.rnn_unit.bias_hh_l0 * grad
+                accumulate_importance(grad_calculated)
+                return grad
+
+            self.importance_score = nn.Parameter(torch.zeros(self.current_level))
+            self._module_instance.rnn_unit.register_full_backward_hook(score_accumulate_hook)
+            self._module_instance.rnn_unit.weight_ih_l0.register_hook(weight_ih_hook)
+            self._module_instance.rnn_unit.weight_hh_l0.register_hook(weight_hh_hook)
+            self._module_instance.rnn_unit.bias_ih_l0.register_hook(bias_ih_hook)
+            self._module_instance.rnn_unit.bias_hh_l0.register_hook(bias_hh_hook)
+
+
+
+
+    def forward(self, x):
+        return self._module_instance(x)
 
     def identity_module(self, cfg, name, input_shape: tuple):
         if type(name) != str:
@@ -278,15 +351,67 @@ class RNNModule(NasModule):
         rnn.bias_ih_l0 = nn.Parameter(self._module_instance.rnn_unit.bias_ih_l0, True)
         rnn.bias_hh_l0 = nn.Parameter(self._module_instance.rnn_unit.bias_hh_l0, True)
         rnn.weight_ih_l0 = \
-            torch.nn.Parameter(self._module_instance.rnn_unit.weight_ih_l0[:, mapping_g] *
+            nn.Parameter(self._module_instance.rnn_unit.weight_ih_l0[:, mapping_g] *
                                scale_g.unsqueeze(0),
                                requires_grad=True)
         rnn.weight_hh_l0 = \
-            torch.nn.Parameter(self._module_instance.rnn_unit.weight_hh_l0,
+            nn.Parameter(self._module_instance.rnn_unit.weight_hh_l0,
                                requires_grad=True)
         self._module_instance = new_module_instance
         self.input_shape = (next_level, self.input_shape[1])
         self.params['input_size'] = next_level
+
+    def perform_prune_current(self, mask):
+        """
+        prune rnn layer by output neuron
+        @param mask:
+        """
+        self.mask_sanity_check(mask)  # ensure mask legal
+        self.current_level = mask.sum().item()
+        new_module_instance = NAS_RNN(
+            input_size=self.params['input_size'],
+            hidden_size=self.current_level,
+            nonlinearity='relu',
+            batch_first=True,
+        )
+
+        # keep previous parameters
+        rnn = new_module_instance.rnn_unit
+        rnn.bias_ih_l0 = nn.Parameter(self._module_instance.rnn_unit.bias_ih_l0[mask])
+        rnn.bias_hh_l0 = nn.Parameter(self._module_instance.rnn_unit.bias_hh_l0[mask])
+        rnn.weight_ih_l0 = nn.Parameter(self._module_instance.rnn_unit.weight_ih_l0[mask])
+        rnn.weight_hh_l0 = nn.Parameter(
+            (self._module_instance.rnn_unit.weight_hh_l0[:, mask])[mask])
+        # make all parameters compact
+        rnn.flatten_parameters()
+
+        self._module_instance = new_module_instance
+        self.output_shape = (self.current_level, self.output_shape[1])
+        self.params['output_size'] = self.current_level
+        self.importance_score = nn.Parameter(self.importance_score[mask])
+
+
+
+    def perform_prune_next(self, mask):
+        input_size = mask.sum().item()
+        new_module_instance = NAS_RNN(
+            input_size=input_size,
+            hidden_size=self.params['output_size'],
+            nonlinearity='relu',
+            batch_first=True,
+        )
+        rnn = new_module_instance.rnn_unit
+        rnn.bias_ih_l0 = nn.Parameter(self._module_instance.rnn_unit.bias_ih_l0, True)
+        rnn.bias_hh_l0 = nn.Parameter(self._module_instance.rnn_unit.bias_hh_l0, True)
+        rnn.weight_ih_l0 = \
+            nn.Parameter(self._module_instance.rnn_unit.weight_ih_l0[:, mask])
+        rnn.weight_hh_l0 = \
+            nn.Parameter(self._module_instance.rnn_unit.weight_hh_l0)
+        # make all parameters compact
+        rnn.flatten_parameters()
+        self._module_instance = new_module_instance
+        self.input_shape = (input_size, self.input_shape[1])
+        self.params['input_size'] = input_size
 
 
 class DenseModule(NasModule):
@@ -294,30 +419,27 @@ class DenseModule(NasModule):
         """
         prune dense layer by row, inplace operation
         :param mask: mask of pruning, should be equal to row of weight
-        :return: None
         """
-
-        weight = nn.Parameter(self._module_instance.weight[mask])
-        bias = nn.Parameter(self._module_instance.bias[mask])
-        self.current_level = weight.shape[0]
+        self.mask_sanity_check(mask)  # ensure mask legal
+        self.current_level = mask.sum().item()
         new_module_instance = nn.Linear(self.params['in_features'], self.current_level)
-        new_module_instance.bias = bias
-        new_module_instance.weight = weight
 
         # assigning new attribute
+        new_module_instance.bias = nn.Parameter(self._module_instance.bias[mask])
+        new_module_instance.weight = nn.Parameter(self._module_instance.weight[mask])
         self._module_instance = new_module_instance
         self.output_shape = (self.output_shape[0], self.current_level)
         self.params['out_features'] = self.current_level
         self.importance_score = nn.Parameter(self.importance_score[mask])
 
-
     def perform_prune_next(self, mask):
         weight = nn.Parameter(self._module_instance.weight[:, mask])
-        self.params['in_features'] = weight.shape[1]
+        self.params['in_features'] = mask.sum().item()
         new_module_instance = nn.Linear(self.params['in_features'], self.current_level)
         new_module_instance.weight = weight
+        new_module_instance.bias = nn.Parameter(self._module_instance.bias)
 
-        # assigning new attribute todo test this
+        # assigning new attribute
         self._module_instance = new_module_instance
         self.input_shape = (self.input_shape[0], self.params['in_features'])
 
@@ -347,7 +469,7 @@ class DenseModule(NasModule):
         self.on_param_end(input_shape)
         # add pruning field
         if self.cfg.NASConfig['Pruning']:
-            self.importance_score = nn.Parameter(torch.zeros_like(self._module_instance.bias))
+            self.importance_score = nn.Parameter(torch.zeros(self.current_level))
 
     def forward(self, x):
         if self.cfg.NASConfig['Pruning']:
@@ -356,7 +478,7 @@ class DenseModule(NasModule):
             weight_mask = ScoreAccumulator.apply(score)  # no change
             # weight_mask = TopKBinarizer.apply(score,1 - self.cfg.NASConfig['PruningRatio'])  # pruning at running
             bias_mask = weight_mask
-            weight_mask = torch.unsqueeze(weight_mask, 1) * torch.ones(self._module_instance.weight.shape[1])
+            weight_mask = torch.unsqueeze(weight_mask, 1) * torch.ones(self._module_instance.weight.shape[1], device=weight_mask.device)
 
             # weight and bias is not changed but score tensor is attached to the computational graph
             masked_weight = self._module_instance.weight * weight_mask
@@ -397,13 +519,14 @@ class DenseModule(NasModule):
         # keep previous parameters
         mapping_g = self.widen_sample_fn(self.current_level, next_level)
         scale_g = [1 / mapping_g.count(i) for i in mapping_g]
-        new_module_instance.bias = torch.nn.Parameter(self._module_instance.bias[mapping_g], requires_grad=True)
-        new_module_instance.weight = torch.nn.Parameter(self._module_instance.weight[mapping_g], requires_grad=True)
+        new_module_instance.bias = nn.Parameter(self._module_instance.bias[mapping_g])
+        new_module_instance.weight = nn.Parameter(self._module_instance.weight[mapping_g])
         self.current_level = next_level
         self._module_instance = new_module_instance
         self.output_shape = (self.output_shape[0], self.current_level)
         self.params['out_features'] = self.current_level
-        # todo finish wider importance score
+        if self.cfg.NASConfig['Pruning']:
+            self.importance_score = Parameter(self.importance_score[mapping_g])
         return mapping_g, scale_g
 
     def perform_wider_transformation_next(self, mapping_g: list, scale_g: list):
@@ -411,8 +534,9 @@ class DenseModule(NasModule):
         scale_g = torch.tensor(scale_g)
         new_module_instance = nn.Linear(next_level, self.params['out_features'])
         # keep previous parameters
-        new_module_instance.weight = torch.nn.Parameter(
-            self._module_instance.weight[:, mapping_g] * scale_g.unsqueeze(0), requires_grad=True)
+        new_module_instance.weight = nn.Parameter(
+            self._module_instance.weight[:, mapping_g] * scale_g.unsqueeze(0))
+        new_module_instance.bias = nn.Parameter(self._module_instance.bias)  # todo this code miss in many module, should fix in the future
         self._module_instance = new_module_instance
         self.input_shape = (self.input_shape[0], next_level)
         self.params['in_features'] = next_level
@@ -500,8 +624,8 @@ class ConvModule(NasModule):
         # keep previous parameters
         mapping_g = self.widen_sample_fn(self.current_level, next_level)
         scale_g = [1 / mapping_g.count(i) for i in mapping_g]
-        new_module_instance.bias = torch.nn.Parameter(self._module_instance.bias[mapping_g], requires_grad=True)
-        new_module_instance.weight = torch.nn.Parameter(self._module_instance.weight[mapping_g], requires_grad=True)
+        new_module_instance.bias = nn.Parameter(self._module_instance.bias[mapping_g], requires_grad=True)
+        new_module_instance.weight = nn.Parameter(self._module_instance.weight[mapping_g], requires_grad=True)
         self.current_level = next_level
         self._module_instance = new_module_instance
         self.output_shape = (self.current_level, self.output_shape[1])
@@ -516,7 +640,7 @@ class ConvModule(NasModule):
                                         kernel_size=self.params['kernel_size'],
                                         stride=self.params['stride'], padding=self.params['padding'])
         new_module_instance.weight = \
-            torch.nn.Parameter(self._module_instance.weight[:, mapping_g] *
+            nn.Parameter(self._module_instance.weight[:, mapping_g] *
                                scale_g.unsqueeze(0).unsqueeze(2),
                                requires_grad=True)
         self._module_instance = new_module_instance
@@ -677,7 +801,7 @@ class ScoreAccumulator(autograd.Function):
 
     @staticmethod
     def forward(ctx, score):
-        return torch.ones_like(score)
+        return torch.ones_like(score, device=score.device)
 
     @staticmethod
     def backward(ctx, gradOutput):

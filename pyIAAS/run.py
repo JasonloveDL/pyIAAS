@@ -1,7 +1,6 @@
 import os
 
 from pyIAAS import *
-from pyIAAS import get_data, train_test_split
 
 
 def set_seed(seed):
