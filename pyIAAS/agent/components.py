@@ -164,8 +164,7 @@ class DeeperActorNet(Module):
 
 
 class SelectorActorNet(Module):
-    """
-    """
+    option_number = 4
     def __init__(self, cfg, input_size):
         """
         selector network, output is 3 dimension:
@@ -179,12 +178,12 @@ class SelectorActorNet(Module):
         self.net = Sequential(
             Linear(input_size, 128),
             LeakyReLU(),
-            Linear(128, 3),
+            Linear(128, self.option_number),
             Sigmoid(),
         )
-        self.no_widen_mask = torch.tensor([1, 0, 1])
-        if self.cfg.NASConfig['GPU']:
-            self.no_widen_mask = self.no_widen_mask.cuda()
+        # self.no_widen_mask = torch.tensor([1, 0, 1])
+        # if self.cfg.NASConfig['GPU']:
+        #     self.no_widen_mask = self.no_widen_mask.cuda()
 
     def forward(self, x):
         x = torch.flatten(x)
@@ -194,8 +193,8 @@ class SelectorActorNet(Module):
     def get_action(self, x, can_widen):
         x = torch.flatten(x)
         prob = self.net(x)
-        if not can_widen:  # do not make widen action when not layer can widen
-            prob = prob * self.no_widen_mask
+        # if not can_widen:  # do not make widen action when not layer can widen
+        #     prob = prob * self.no_widen_mask
         prob = prob / prob.sum()
         action = Categorical(prob).sample()
         return action, prob

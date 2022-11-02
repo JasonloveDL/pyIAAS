@@ -6,7 +6,7 @@ set_seed(0)
 config_file = 'NASConfig.json'
 input_file = 'VT_summer.csv'
 target_name = 'RT_Demand'
-test_ratio = 0.2  # the proportion of the test dataset in the whole dataset. It can be adjusted by users themself for specific tasks
+test_ratio = 0.2
 
 # load configuration file
 cfg = Config(config_file)
@@ -23,7 +23,8 @@ x, y = get_data(cache_dir, input_file, target_name,
 data = train_test_split(x, y, test_ratio)
 data = [torch.tensor(i, dtype=torch.float) for i in data]
 
-devices = [torch.device('cpu')]
+devices = []
+# devices.append(torch.device('cpu'))
 if torch.cuda.is_available():
     devices.append(torch.device('cuda'))
 
@@ -31,11 +32,12 @@ if torch.cuda.is_available():
 class MyTestCase(unittest.TestCase):
     def test_prune(self):
         skeleton_list = [  # prune structure to test
-            ['dense', 'dense'],
-            ['rnn', 'rnn'],
-            # ['dense', 'rnn'], # 混合类型剪枝需要后续进行修改
-            # ['rnn', 'dense'],
+            ['lstm', 'lstm'],
         ]
+        # type_list = ['dense', 'rnn', 'conv','lstm']
+        # skeleton_list = list(itertools.product(type_list, type_list))
+        # skeleton_list = [list(i) for i in skeleton_list]
+
         prune_loop_times = 3
         for skeleton in skeleton_list:
             feature_shape = data[0].shape[1:]
@@ -52,7 +54,7 @@ class MyTestCase(unittest.TestCase):
                     loss_prev = model_raw.test(X_test, y_test)
                     print('\n')
                     print(f'before pruning: {model_raw}')
-                    model_raw.prune()
+                    model_raw = model_raw.prune()
                     loss_after = model_raw.test(X_test, y_test)
                     print(f'after pruning: {model_raw}')
                     print(f'{device} before prune:{loss_prev}\t after prune:{loss_after}')

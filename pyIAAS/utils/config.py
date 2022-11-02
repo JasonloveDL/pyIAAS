@@ -17,19 +17,20 @@ class Config:
     """
     Configuration file of the whole training process
     """
+
     def __init__(self, nasConfig_file):
+        super().__init__()
         with open(nasConfig_file) as f:
-            self.NASConfig = ObjectDict(json.load(f))
-        self.modulesConfig = self.NASConfig['Modules']
+            self.NASConfig: ObjectDict = ObjectDict(json.load(f))
+        self.modulesConfig: dict = self.NASConfig['Modules']
         self.NASConfig['editable'] = []
-        self.modulesCls = {}
+        self.modulesCls: dict = {}
         for k in self.modulesConfig.keys():
             if self.modulesConfig[k]['editable']:
                 self.NASConfig['editable'].append(k)
             if k in _defaultCls:
                 self.modulesCls[k] = _defaultCls[k]
-        self.modulesList = list(self.modulesConfig.keys())
-
+        self.modulesList: list = list(self.modulesConfig.keys())
 
     @property
     def LOG_FILE(self):

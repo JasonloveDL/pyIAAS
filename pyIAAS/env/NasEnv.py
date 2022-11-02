@@ -5,8 +5,8 @@ from typing import Any
 import gym
 import numpy as np
 
-from ..utils.logger import get_logger
 from ..model import generate_new_model_config, reset_model_count
+from ..utils.logger import get_logger
 
 
 class NasEnv(gym.Env):
@@ -61,12 +61,15 @@ class NasEnv(gym.Env):
                 if len(net.model_config.modules) <= self.cfg.NASConfig['MaxLayers']:  # constrain the network's depth
                     net_pool.append(net)
                 continue
+            if select == 3:  # prune the net
+                self.logger.info(f"net index {i}-{net.index} :prune the net")
+                net = net.prune()
+                net_pool.append(net)
+                continue
         self.net_pool = net_pool
         X_train, y_train, X_test, y_test = self.train_test_data
         feature_shape = X_train.shape[1:]
-        base_structure = [  # manual design
-            ['dense'],
-        ]
+        base_structure = [[i] for i in self.cfg.modulesList]
         skeleton = random.sample(base_structure, 1)[0]
         self.net_pool.append(generate_new_model_config(self.cfg, feature_shape, 1, skeleton).generate_model())
         self.net_pool = list(set(self.net_pool))

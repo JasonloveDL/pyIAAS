@@ -1,19 +1,19 @@
 import abc
+import math
 import random
-from typing import Any
 
-import torch.autograd as autograd
 import torch
+import torch.autograd as autograd
 import torch.nn as nn
 from torch import Tensor
-from torch.nn import init, Module, Parameter
 from torch.nn import functional as F
+from torch.nn import init, Module, Parameter
 
 from ..utils.logger import get_logger
 
 
 class NasModule(nn.Module):
-    def __init__(self, cfg, name, input_shape):
+    def __init__(self, cfg, name: str, input_shape):
         """
         basic module composing neural networks.
         :param cfg: global configuration
@@ -84,8 +84,9 @@ class NasModule(nn.Module):
         self.input_shape = tuple(self.input_shape)
         self.output_shape = tuple(self.output_shape)
 
+    @staticmethod
     @abc.abstractmethod
-    def identity_module(self, cfg, name, input_shape: tuple):
+    def identity_module(cfg, name, input_shape: tuple):
         """
         generate an identity mapping module
         :rtype: NasModule
@@ -186,7 +187,7 @@ class RNNModule(NasModule):
         out_range = list(out_range)
         valid_range = []
         for i in out_range:
-            if i > self.current_level:
+            if i >= self.current_level:
                 valid_range.append(i)
         return min(valid_range)
 
@@ -195,15 +196,9 @@ class RNNModule(NasModule):
         self.params = dict()
         out_range = self.cfg.modulesConfig['rnn']['out_range']
         self.current_level = self.get_level(out_range)
-        self.params['input_size'] = input_shape[0]
+        self.params['input_size'] = input_shape[1]
         self.params['output_size'] = self.current_level
         # get output shape
-        m = self.get_module_instance()
-        input_data = torch.zeros([1, *input_shape])
-        output = m(input_data)
-        self.output_shape = output.shape[1:]
-        self.input_shape = tuple(self.input_shape)
-        self.output_shape = tuple(self.output_shape)
         self.on_param_end(input_shape)
         # add pruning field
         if self.cfg.NASConfig['Pruning']:
@@ -256,24 +251,22 @@ class RNNModule(NasModule):
                 return grad
 
             self.importance_score = nn.Parameter(torch.zeros(self.current_level))
-            self._module_instance.rnn_unit.register_full_backward_hook(score_accumulate_hook)
+            # self._module_instance.rnn_unit.register_full_backward_hook(score_accumulate_hook)
             self._module_instance.rnn_unit.weight_ih_l0.register_hook(weight_ih_hook)
             self._module_instance.rnn_unit.weight_hh_l0.register_hook(weight_hh_hook)
             self._module_instance.rnn_unit.bias_ih_l0.register_hook(bias_ih_hook)
             self._module_instance.rnn_unit.bias_hh_l0.register_hook(bias_hh_hook)
 
-
-
-
     def forward(self, x):
         return self._module_instance(x)
 
-    def identity_module(self, cfg, name, input_shape: tuple):
+    @staticmethod
+    def identity_module(cfg, name, input_shape: tuple):
         if type(name) != str:
             name = cfg.NASConfig['editable'][name]
         module = RNNModule(cfg, name, input_shape)
-        output_size = input_shape[0]
-        input_size = input_shape[0]
+        output_size = input_shape[1]
+        input_size = input_shape[1]
         module.params = {
             "output_size": output_size,
             "input_size": input_size,
@@ -295,6 +288,8 @@ class RNNModule(NasModule):
         weight_hh_l0 = torch.zeros((output_size, output_size))
         rnn.rnn_unit.weight_hh_l0 = nn.Parameter(weight_hh_l0, True)
         module._module_instance = rnn
+        if cfg.NASConfig['Pruning']:
+            module.importance_score = nn.Parameter(torch.zeros(module.current_level))
         return module
 
     def get_module_instance(self):
@@ -336,6 +331,8 @@ class RNNModule(NasModule):
         self._module_instance = new_module_instance
         self.output_shape = (self.current_level, self.output_shape[1])
         self.params['output_size'] = self.current_level
+        if self.cfg.NASConfig['Pruning']:
+            self.importance_score = Parameter(self.importance_score[mapping_g])
         return mapping_g, scale_g
 
     def perform_wider_transformation_next(self, mapping_g: list, scale_g: list):
@@ -352,11 +349,11 @@ class RNNModule(NasModule):
         rnn.bias_hh_l0 = nn.Parameter(self._module_instance.rnn_unit.bias_hh_l0, True)
         rnn.weight_ih_l0 = \
             nn.Parameter(self._module_instance.rnn_unit.weight_ih_l0[:, mapping_g] *
-                               scale_g.unsqueeze(0),
-                               requires_grad=True)
+                         scale_g.unsqueeze(0),
+                         requires_grad=True)
         rnn.weight_hh_l0 = \
             nn.Parameter(self._module_instance.rnn_unit.weight_hh_l0,
-                               requires_grad=True)
+                         requires_grad=True)
         self._module_instance = new_module_instance
         self.input_shape = (next_level, self.input_shape[1])
         self.params['input_size'] = next_level
@@ -389,8 +386,6 @@ class RNNModule(NasModule):
         self.output_shape = (self.current_level, self.output_shape[1])
         self.params['output_size'] = self.current_level
         self.importance_score = nn.Parameter(self.importance_score[mask])
-
-
 
     def perform_prune_next(self, mask):
         input_size = mask.sum().item()
@@ -443,7 +438,6 @@ class DenseModule(NasModule):
         self._module_instance = new_module_instance
         self.input_shape = (self.input_shape[0], self.params['in_features'])
 
-
     @property
     def is_max_level(self):
         out_range = self.cfg.modulesConfig['dense']['out_range']
@@ -455,7 +449,7 @@ class DenseModule(NasModule):
         out_range = list(out_range)
         valid_range = []
         for i in out_range:
-            if i > self.current_level:
+            if i >= self.current_level:
                 valid_range.append(i)
         return min(valid_range)
 
@@ -478,7 +472,8 @@ class DenseModule(NasModule):
             weight_mask = ScoreAccumulator.apply(score)  # no change
             # weight_mask = TopKBinarizer.apply(score,1 - self.cfg.NASConfig['PruningRatio'])  # pruning at running
             bias_mask = weight_mask
-            weight_mask = torch.unsqueeze(weight_mask, 1) * torch.ones(self._module_instance.weight.shape[1], device=weight_mask.device)
+            weight_mask = torch.unsqueeze(weight_mask, 1) * torch.ones(self._module_instance.weight.shape[1],
+                                                                       device=weight_mask.device)
 
             # weight and bias is not changed but score tensor is attached to the computational graph
             masked_weight = self._module_instance.weight * weight_mask
@@ -487,7 +482,8 @@ class DenseModule(NasModule):
         else:
             return self._module_instance(x)
 
-    def identity_module(self, cfg, name, input_shape: tuple):
+    @staticmethod
+    def identity_module(cfg, name, input_shape: tuple):
         if type(name) != str:
             name = cfg.NASConfig['editable'][name]
         module = DenseModule(cfg, name, input_shape)
@@ -499,8 +495,8 @@ class DenseModule(NasModule):
         module.params = {'in_features': input_shape[1], 'out_features': input_shape[1]}
         module._module_instance = dense
         # add pruning field
-        if self.cfg.NASConfig['Pruning']:
-            module.importance_score = nn.Parameter(torch.zeros_like(self._module_instance.bias))
+        if cfg.NASConfig['Pruning']:
+            module.importance_score = nn.Parameter(torch.zeros(module.current_level))
         return module
 
     def get_module_instance(self):
@@ -536,13 +532,48 @@ class DenseModule(NasModule):
         # keep previous parameters
         new_module_instance.weight = nn.Parameter(
             self._module_instance.weight[:, mapping_g] * scale_g.unsqueeze(0))
-        new_module_instance.bias = nn.Parameter(self._module_instance.bias)  # todo this code miss in many module, should fix in the future
+        new_module_instance.bias = nn.Parameter(
+            self._module_instance.bias)
         self._module_instance = new_module_instance
         self.input_shape = (self.input_shape[0], next_level)
         self.params['in_features'] = next_level
 
 
 class ConvModule(NasModule):
+    def perform_prune_current(self, mask):
+        """
+        prune conv layer by feature maps, inplace operation
+        :param mask: mask of pruning, should be equal to out channels of module
+        """
+        self.mask_sanity_check(mask)  # ensure mask legal
+        self.current_level = mask.sum().item()
+        new_module_instance = nn.Conv1d(in_channels=self.params['in_channels'],
+                                        out_channels=self.current_level,
+                                        kernel_size=self.params['kernel_size'],
+                                        stride=self.params['stride'],
+                                        padding=self.params['padding'])
+
+        # assigning new attribute
+        new_module_instance.bias = nn.Parameter(self._module_instance.bias[mask])
+        new_module_instance.weight = nn.Parameter(self._module_instance.weight[mask])
+        self._module_instance = new_module_instance
+        self.output_shape = (self.output_shape[0], self.current_level)
+        self.params['out_channels'] = self.current_level
+        self.importance_score = nn.Parameter(self.importance_score[mask])
+
+    def perform_prune_next(self, mask):
+        self.params['in_channels'] = mask.sum().item()
+        new_module_instance = nn.Conv1d(in_channels=self.params['in_channels'],
+                                        out_channels=self.params['out_channels'],
+                                        kernel_size=self.params['kernel_size'],
+                                        stride=self.params['stride'], padding=self.params['padding'])
+        new_module_instance.weight = nn.Parameter(self._module_instance.weight[:, mask])
+        new_module_instance.bias = self._module_instance.bias
+
+        # assigning new attribute
+        self._module_instance = new_module_instance
+        self.input_shape = (self.input_shape[0], self.params['in_channels'])
+
     @property
     def is_max_level(self):
         out_range = self.cfg.modulesConfig['conv']['out_range']
@@ -554,30 +585,54 @@ class ConvModule(NasModule):
         out_range = list(out_range)
         valid_range = []
         for i in out_range:
-            if i > self.current_level:
+            if i >= self.current_level:
                 valid_range.append(i)
         return min(valid_range)
 
     def init_param(self, input_shape):
         assert len(input_shape) == 2
-        self.params = {'in_channels': input_shape[0]}
+        self.params = {'in_channels': input_shape[1]}
         out_range = self.cfg.modulesConfig['conv']['out_range']
         self.current_level = self.get_level(out_range)
         self.params['out_channels'] = self.current_level
         self.params['kernel_size'] = 3
         self.params['stride'] = 1
         self.params['padding'] = 1
+        self.on_param_end(input_shape[::-1])
+        self.output_shape = self.output_shape[::-1]
+        # add pruning field
+        if self.cfg.NASConfig['Pruning']:
+            self.importance_score = nn.Parameter(torch.zeros(self.current_level))
 
-        self.on_param_end(input_shape)
+    def forward(self, x):
+        x = x.permute(0, 2, 1)
+        if self.cfg.NASConfig['Pruning']:
+            assert self.importance_score is not None
+            # accumulate importance score of whole row, we use this as importance estimation of output neuron
+            score = self.importance_score
+            weight_mask = ScoreAccumulator.apply(score)  # no change
+            # weight_mask = TopKBinarizer.apply(score,1 - self.cfg.NASConfig['PruningRatio'])  # pruning at running
+            bias_mask = weight_mask
 
-    def identity_module(self, cfg, name, input_shape: tuple):
+            # weight and bias is not changed but score tensor is attached to the computational graph
+            masked_weight = self._module_instance.weight * torch.unsqueeze(torch.unsqueeze(weight_mask, 1), 1)
+            masked_bias = self._module_instance.bias * bias_mask
+            y = F.conv1d(x, masked_weight, masked_bias, self._module_instance.stride,
+                         self._module_instance.padding)
+        else:
+            y = self._module_instance(x)
+        y = y.permute(0, 2, 1)
+        return y
+
+    @staticmethod
+    def identity_module(cfg, name, input_shape: tuple):
         if type(name) != str:
             name = cfg.NASConfig['editable'][name]
         module = ConvModule(cfg, name, input_shape)
-        out_channel = input_shape[0]
-        in_channel = input_shape[0]
+        out_channel = input_shape[1]
+        in_channel = input_shape[1]
         kernel_size = 3
-        module.current_level = input_shape[0]
+        module.current_level = out_channel
         module.output_shape = input_shape
         module.params = {
             "in_channels": in_channel,
@@ -598,6 +653,8 @@ class ConvModule(NasModule):
         bias = torch.zeros(out_channel)
         conv.bias = nn.Parameter(bias)
         module._module_instance = conv
+        if cfg.NASConfig['Pruning']:
+            module.importance_score = nn.Parameter(torch.zeros(module.current_level))
         return module
 
     def get_module_instance(self):
@@ -620,16 +677,19 @@ class ConvModule(NasModule):
         new_module_instance = nn.Conv1d(in_channels=self.params['in_channels'],
                                         out_channels=self.next_level,
                                         kernel_size=self.params['kernel_size'],
-                                        stride=self.params['stride'], padding=self.params['padding'])
+                                        stride=self.params['stride'],
+                                        padding=self.params['padding'])
         # keep previous parameters
         mapping_g = self.widen_sample_fn(self.current_level, next_level)
         scale_g = [1 / mapping_g.count(i) for i in mapping_g]
-        new_module_instance.bias = nn.Parameter(self._module_instance.bias[mapping_g], requires_grad=True)
-        new_module_instance.weight = nn.Parameter(self._module_instance.weight[mapping_g], requires_grad=True)
+        new_module_instance.bias = nn.Parameter(self._module_instance.bias[mapping_g])
+        new_module_instance.weight = nn.Parameter(self._module_instance.weight[mapping_g])
         self.current_level = next_level
         self._module_instance = new_module_instance
-        self.output_shape = (self.current_level, self.output_shape[1])
+        self.output_shape = (self.output_shape[0], self.current_level)
         self.params['out_channels'] = self.current_level
+        if self.cfg.NASConfig['Pruning']:
+            self.importance_score = Parameter(self.importance_score[mapping_g])
         return mapping_g, scale_g
 
     def perform_wider_transformation_next(self, mapping_g: list, scale_g: list):
@@ -641,14 +701,48 @@ class ConvModule(NasModule):
                                         stride=self.params['stride'], padding=self.params['padding'])
         new_module_instance.weight = \
             nn.Parameter(self._module_instance.weight[:, mapping_g] *
-                               scale_g.unsqueeze(0).unsqueeze(2),
-                               requires_grad=True)
+                         scale_g.unsqueeze(0).unsqueeze(2), )
+        new_module_instance.bias = self._module_instance.bias
         self._module_instance = new_module_instance
-        self.input_shape = (next_level, self.input_shape[1])
         self.params['in_channels'] = next_level
+        self.input_shape = (self.input_shape[0], self.params['in_channels'])
 
 
 class LSTMModule(NasModule):
+    def perform_prune_current(self, mask):
+        """
+        prune rnn layer by output neuron
+        @param mask:
+        """
+        self.mask_sanity_check(mask)  # ensure mask legal
+        self.current_level = mask.sum().item()
+        new_module_instance = NAS_SLSTM(self.params['input_size'], self.current_level)
+
+        # keep previous parameters
+        new_module_instance.cell.weight_ih = nn.Parameter(
+            torch.cat(tuple(map(lambda x: x[:, mask], self._module_instance.cell.weight_ih.chunk(4, 1))), dim=1))
+        new_module_instance.cell.weight_hh = nn.Parameter(
+            torch.cat(tuple(map(lambda x: x[mask][:, mask], self._module_instance.cell.weight_hh.chunk(4, 1))), dim=1))
+        new_module_instance.cell.bias_ih = nn.Parameter(
+            torch.cat(tuple(map(lambda x: x[mask], self._module_instance.cell.bias_ih.chunk(4)))))
+
+        self._module_instance = new_module_instance
+        self.output_shape = (self.current_level, self.output_shape[1])
+        self.params['output_size'] = self.current_level
+        self.importance_score = nn.Parameter(self.importance_score[mask])
+
+    def perform_prune_next(self, mask):
+        input_size = mask.sum().item()
+        new_module_instance = NAS_SLSTM(input_size, self.params['output_size'])
+        new_module_instance.cell.weight_ih = nn.Parameter(self._module_instance.cell.weight_ih[mask])
+        new_module_instance.cell.weight_hh = nn.Parameter(self._module_instance.cell.weight_hh)
+        new_module_instance.cell.bias_ih = nn.Parameter(self._module_instance.cell.bias_ih)
+
+        self._module_instance = new_module_instance
+
+        self.input_shape = (input_size, self.input_shape[1])
+        self.params['input_size'] = input_size
+
     @property
     def is_max_level(self):
         out_range = self.cfg.modulesConfig['lstm']['out_range']
@@ -660,7 +754,7 @@ class LSTMModule(NasModule):
         out_range = list(out_range)
         valid_range = []
         for i in out_range:
-            if i > self.current_level:
+            if i >= self.current_level:
                 valid_range.append(i)
         return min(valid_range)
 
@@ -669,24 +763,72 @@ class LSTMModule(NasModule):
         self.params = dict()
         out_range = self.cfg.modulesConfig['lstm']['out_range']
         self.current_level = self.get_level(out_range)
-        self.params['input_size'] = input_shape[0]
+        self.params['input_size'] = input_shape[1]
         self.params['output_size'] = self.current_level
         self.on_param_end(input_shape)
+        self.output_shape = self.output_shape
+        # add pruning field
+        if self.cfg.NASConfig['Pruning']:
+            self.importance_score = nn.Parameter(torch.zeros(self.current_level))
+            clip_threshold = 1e6
 
-    def identity_module(self, cfg, name, input_shape: tuple):
+            def accumulate_importance(score):
+                if self.importance_score.grad is None:
+                    self.importance_score.grad = score
+                else:
+                    self.importance_score.grad += score
+
+            def weight_ih_accumulate(grad):
+                # add gradient clip to avoid gradient exploding
+                grad = torch.clip(grad, -clip_threshold, clip_threshold)
+                weight = self._module_instance.cell.weight_ih
+                grad_calculated = torch.sum(weight * grad, 0)
+                grad_calculated = sum(grad_calculated.chunk(4))
+                accumulate_importance(grad_calculated)
+                return grad
+
+            def weight_hh_accumulate(grad):
+                grad = torch.clip(grad, -clip_threshold, clip_threshold)
+                weight = self._module_instance.cell.weight_hh
+                grad_calculated = weight * grad
+                gates = grad_calculated.chunk(4, 1)
+                grad_calculated = sum(map(lambda x: torch.sum(x, 0), gates)) + sum(
+                    map(lambda x: torch.sum(x, 1), gates))
+                accumulate_importance(grad_calculated)
+                return grad
+
+            def bias_ih_accumulate(grad):
+                grad = torch.clip(grad, -clip_threshold, clip_threshold)
+                weight = self._module_instance.cell.bias_ih
+                grad_calculated = weight * grad
+                grad_calculated = sum(grad_calculated.chunk(4))
+                accumulate_importance(grad_calculated)
+                return grad
+
+            self._module_instance.cell.weight_ih.register_hook(weight_ih_accumulate)
+            self._module_instance.cell.weight_hh.register_hook(weight_hh_accumulate)
+            self._module_instance.cell.bias_ih.register_hook(bias_ih_accumulate)
+
+    def forward(self, x):
+        return self.get_module_instance()(x)
+
+    @staticmethod
+    def identity_module(cfg, name, input_shape: tuple):
         if type(name) != str:
             name = cfg.NASConfig['editable'][name]
         module = LSTMModule(cfg, name, input_shape)
-        hidden_size = input_shape[0]
-        input_size = input_shape[0]
+        hidden_size = input_shape[1]
+        input_size = input_shape[1]
         module.params = {
-            "hidden_size": hidden_size,
+            "output_size": hidden_size,
             "input_size": input_size,
         }
         module.current_level = hidden_size
         module.output_shape = input_shape
         identity_lstm = NAS_SLSTM.generate_identity(input_size)
         module._module_instance = identity_lstm
+        if cfg.NASConfig['Pruning']:
+            module.importance_score = nn.Parameter(torch.zeros(module.current_level))
         return module
 
     def get_module_instance(self):
@@ -696,6 +838,8 @@ class LSTMModule(NasModule):
             input_size=self.params['input_size'],
             hidden_size=self.params['output_size'],
         )
+        # if not isinstance(self._module_instance,torch.jit.RecursiveScriptModule):
+        #     self._module_instance = torch.jit.script(self._module_instance)
         return self._module_instance
 
     @property
@@ -709,42 +853,29 @@ class LSTMModule(NasModule):
         mapping_g = self.widen_sample_fn(self.current_level, next_level)
         scale_g = [1 / mapping_g.count(i) for i in mapping_g]
         scale_g = torch.tensor(scale_g)
-        lstm = new_module_instance
-        lstm.Wf = nn.Parameter(self._module_instance.Wf[:, mapping_g])
-        lstm.Wi = nn.Parameter(self._module_instance.Wi[:, mapping_g])
-        lstm.Wo = nn.Parameter(self._module_instance.Wo[:, mapping_g])
-        lstm.Wc = nn.Parameter(self._module_instance.Wc[:, mapping_g])
-        lstm.bf = nn.Parameter(self._module_instance.bf[mapping_g])
-        lstm.bi = nn.Parameter(self._module_instance.bi[mapping_g])
-        lstm.bo = nn.Parameter(self._module_instance.bo[mapping_g])
-        lstm.bc = nn.Parameter(self._module_instance.bc[mapping_g])
-        lstm.Uf = nn.Parameter((self._module_instance.Uf.T[:, mapping_g] * scale_g)[mapping_g].T)
-        lstm.Ui = nn.Parameter((self._module_instance.Ui.T[:, mapping_g] * scale_g)[mapping_g].T)
-        lstm.Uo = nn.Parameter((self._module_instance.Uo.T[:, mapping_g] * scale_g)[mapping_g].T)
-        lstm.Uc = nn.Parameter((self._module_instance.Uc.T[:, mapping_g] * scale_g)[mapping_g].T)
+        new_module_instance.cell.weight_ih = nn.Parameter(
+            torch.cat(tuple(map(lambda x: x[:, mapping_g], self._module_instance.cell.weight_ih.chunk(4, 1))), dim=1))
+        new_module_instance.cell.weight_hh = nn.Parameter(torch.cat(tuple(
+            map(lambda x: x[mapping_g][:, mapping_g] * torch.unsqueeze(scale_g, 1),
+                self._module_instance.cell.weight_hh.chunk(4, 1))), dim=1))
+        new_module_instance.cell.bias_ih = nn.Parameter(
+            torch.cat(tuple(map(lambda x: x[mapping_g], self._module_instance.cell.bias_ih.chunk(4)))))
         self.current_level = next_level
         self._module_instance = new_module_instance
         self.output_shape = (self.current_level, self.output_shape[1])
         self.params['output_size'] = self.current_level
+        if self.cfg.NASConfig['Pruning']:
+            self.importance_score = Parameter(self.importance_score[mapping_g])
         return mapping_g, scale_g
 
     def perform_wider_transformation_next(self, mapping_g: list, scale_g: list):
         next_level = len(mapping_g)
         scale_g = torch.tensor(scale_g)
         new_module_instance = NAS_SLSTM(next_level, self.params['output_size'])
-        lstm = new_module_instance
-        lstm.Wf = nn.Parameter(self._module_instance.Wf[mapping_g] * scale_g.unsqueeze(1))
-        lstm.Wi = nn.Parameter(self._module_instance.Wi[mapping_g] * scale_g.unsqueeze(1))
-        lstm.Wo = nn.Parameter(self._module_instance.Wo[mapping_g] * scale_g.unsqueeze(1))
-        lstm.Wc = nn.Parameter(self._module_instance.Wc[mapping_g] * scale_g.unsqueeze(1))
-        lstm.bf = nn.Parameter(self._module_instance.bf)
-        lstm.bi = nn.Parameter(self._module_instance.bi)
-        lstm.bo = nn.Parameter(self._module_instance.bo)
-        lstm.bc = nn.Parameter(self._module_instance.bc)
-        lstm.Uf = nn.Parameter(self._module_instance.Uf)
-        lstm.Ui = nn.Parameter(self._module_instance.Ui)
-        lstm.Uo = nn.Parameter(self._module_instance.Uo)
-        lstm.Uc = nn.Parameter(self._module_instance.Uc)
+        new_module_instance.cell.weight_ih = nn.Parameter(
+            self._module_instance.cell.weight_ih[mapping_g] * torch.unsqueeze(scale_g, 1))
+        new_module_instance.cell.weight_hh = nn.Parameter(self._module_instance.cell.weight_hh)
+        new_module_instance.cell.bias_ih = nn.Parameter(self._module_instance.cell.bias_ih)
         self._module_instance = new_module_instance
         self.input_shape = (next_level, self.input_shape[1])
         self.params['input_size'] = next_level
@@ -815,11 +946,35 @@ class NAS_RNN(nn.Module):
         self.rnn_unit = nn.RNN(*args, **kwargs)
 
     def forward(self, x: Tensor):
-        x = x.permute(0, 2, 1)
         output, hn = self.rnn_unit(x)
         y = output
-        y = y.permute(0, 2, 1)
         return y
+
+
+class LSTMCell(nn.Module):
+    def __init__(self, input_size, hidden_size):
+        super(LSTMCell, self).__init__()
+        self.input_size = input_size
+        self.hidden_size = hidden_size
+        self.weight_ih = Parameter(torch.randn(input_size, 4 * hidden_size))
+        self.weight_hh = Parameter(torch.randn(hidden_size, 4 * hidden_size))
+        self.bias_ih = Parameter(torch.randn(4 * hidden_size))
+
+    def forward(self, input: Tensor, h, c):
+        hx, cx = h, c
+        gates = (torch.mm(input, self.weight_ih) + self.bias_ih +
+                 torch.mm(hx, self.weight_hh))
+        ingate, forgetgate, cellgate, outgate = gates.chunk(4, 1)
+
+        ingate = torch.sigmoid(ingate)
+        forgetgate = torch.sigmoid(forgetgate)
+        cellgate = torch.tanh(cellgate)
+        outgate = outgate
+
+        cy = (forgetgate * cx) + (ingate * cellgate)
+        hy = outgate * torch.tanh(cy) + outgate
+
+        return hy, cy
 
 
 class NAS_SLSTM(nn.Module):
@@ -828,73 +983,41 @@ class NAS_SLSTM(nn.Module):
         super().__init__()
         self.hidden_size = hidden_size
         self.input_size = input_size
-        self.Wf = nn.Parameter(torch.empty(input_size, hidden_size))
-        self.Wi = nn.Parameter(torch.empty(input_size, hidden_size))
-        self.Wc = nn.Parameter(torch.empty(input_size, hidden_size))
-        self.Wo = nn.Parameter(torch.empty(input_size, hidden_size))
-        self.Uf = nn.Parameter(torch.empty(hidden_size, hidden_size))
-        self.Ui = nn.Parameter(torch.empty(hidden_size, hidden_size))
-        self.Uc = nn.Parameter(torch.empty(hidden_size, hidden_size))
-        self.Uo = nn.Parameter(torch.empty(hidden_size, hidden_size))
-        self.bf = nn.Parameter(torch.zeros(hidden_size))
-        self.bi = nn.Parameter(torch.zeros(hidden_size))
-        self.bc = nn.Parameter(torch.zeros(hidden_size))
-        self.bo = nn.Parameter(torch.zeros(hidden_size))
+        self.cell = LSTMCell(input_size, hidden_size)
         self.reset_parameters()
 
     def reset_parameters(self) -> None:
-        init.kaiming_uniform_(self.Wf)
-        init.kaiming_uniform_(self.Wi)
-        init.kaiming_uniform_(self.Wc)
-        init.kaiming_uniform_(self.Wo)
-        init.kaiming_uniform_(self.Uf)
-        init.kaiming_uniform_(self.Ui)
-        init.kaiming_uniform_(self.Uc)
-        init.kaiming_uniform_(self.Uo)
-
-    def forward_step(self, x, h, c):
         """
-        do one step LSTM forward calculation
-        @param x: input shape [batch, feature]
+        follow implementation with pytorch
         """
-        ft = torch.sigmoid(torch.matmul(x, self.Wf) + torch.matmul(h, self.Uf) + self.bf)
-        it = torch.sigmoid(torch.matmul(x, self.Wi) + torch.matmul(h, self.Ui) + self.bi)
-        ot = torch.matmul(x, self.Wo) + torch.matmul(h, self.Uo) + self.bo
-        c_ = torch.tanh(torch.matmul(x, self.Wc) + torch.matmul(h, self.Uc) + self.bc)
-        c = ft * c + it * c_
-        h = ot * torch.tanh(c) + ot
-        return h, c
+        stdv = 1.0 / math.sqrt(self.hidden_size) if self.hidden_size > 0 else 0
+        for weight in self.parameters():
+            init.uniform_(weight, -stdv, stdv)
 
     def forward(self, x):
-        '''
+        """
         forward propagation
-        @param x:  input of size [batch, feature, seqlen]
-        @return: hidden state (batch, feature,seqlen)
-        '''
+        @param x:  input of size [batch, seqlen, feature]
+        @return: hidden state [batch, seqlen, feature]
+        """
         h = torch.zeros((x.shape[0], self.hidden_size), device=x.device)
         c = torch.zeros((x.shape[0], self.hidden_size), device=x.device)
-        output = []
-        for i in range(x.shape[2]):
-            h, c = self.forward_step(x[:, :, i], h, c)
-            output.append((h, c))
-        output = [torch.stack([i[0] for i in output]), torch.stack([i[1] for i in output])]
-        return output[0].permute(1, 2, 0)
+        input = x.unbind(1)
+        outputs = []
+        for i in range(len(input)):
+            h, c = self.cell(input[i], h, c)
+            outputs += [h]
+        output = torch.stack(outputs, 1)
+        return output
 
     @staticmethod
     def generate_identity(input_size):
         lstm = NAS_SLSTM(input_size, input_size)
-        lstm.Wo = nn.Parameter(torch.eye(input_size))
-        lstm.Wf = nn.Parameter(torch.zeros_like(lstm.Wf))
-        lstm.Wi = nn.Parameter(torch.zeros_like(lstm.Wi))
-        lstm.Wc = nn.Parameter(torch.zeros_like(lstm.Wc))
-        lstm.Uf = nn.Parameter(torch.zeros_like(lstm.Uf))
-        lstm.Uc = nn.Parameter(torch.zeros_like(lstm.Uc))
-        lstm.Ui = nn.Parameter(torch.zeros_like(lstm.Ui))
-        lstm.Uo = nn.Parameter(torch.zeros_like(lstm.Uo))
-        lstm.bf = nn.Parameter(torch.zeros_like(lstm.bf))
-        lstm.bc = nn.Parameter(torch.zeros_like(lstm.bc))
-        lstm.bi = nn.Parameter(torch.zeros_like(lstm.bi))
-        lstm.bo = nn.Parameter(torch.zeros_like(lstm.bo))
+        weight_ih = torch.zeros_like(lstm.cell.weight_ih)
+        weight_ih[:, 3 * input_size:] = torch.eye(input_size)
+        lstm.cell.weight_ih = nn.Parameter(weight_ih)
+        lstm.cell.weight_hh = nn.Parameter(torch.zeros_like(lstm.cell.weight_hh))
+        lstm.cell.bias_ih = nn.Parameter(torch.zeros_like(lstm.cell.bias_ih))
         return lstm
 
 

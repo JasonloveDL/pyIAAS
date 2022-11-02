@@ -1,9 +1,11 @@
 import copy
+import os
 import random
 import time
 
 import matplotlib.pyplot as plt
 import numpy as np
+import pandas
 import pandas as pd
 import torch.nn
 from torch.utils.data.dataloader import *
@@ -16,7 +18,8 @@ from ..utils.sql_connector import get_total_model_count, insert_new_model_config
 
 total_model_count = None
 activate = torch.nn.ReLU
-plt.rcParams['figure.figsize']  =  [16, 4]
+plt.rcParams['figure.figsize'] = [16, 4]
+
 
 def reset_model_count():
     global total_model_count
@@ -50,14 +53,6 @@ class ModelConfig:
     @property
     def widenable_list(self):
         widenable = [m.widenable for m in self.modules]
-        for i in range(len(self.modules) - 1):
-            # Widening is allowed for the previous one of the continuously same widening modules
-            if widenable[i] and \
-                    self.modules[i].name == self.modules[i + 1].name \
-                    and not self.modules[i].is_max_level:
-                widenable[i] = True
-            else:
-                widenable[i] = False
         widenable[-1] = False  # The last layer is not allowed to be widened
         return widenable
 
@@ -88,13 +83,15 @@ class ModelConfig:
         self.tail_layers.append(torch.nn.Linear(output_shape, self.target_shape))
         module_instances = [*module_instances, *self.tail_layers]
         model_instance = torch.nn.Sequential(*module_instances)
-        return NasModel(self.cfg, model_instance, self)
+        m = NasModel(self.cfg, model_instance, self)
+        m.warm_start = True
+        return m
 
     @property
     def token_list(self):
         token_list = []
         for m in self.modules:
-            assert isinstance(m, NasModule)  #  m should be subclass of NAS_Module
+            assert isinstance(m, NasModule)  # m should be subclass of NAS_Module
             token_list.append(m.token)
         return token_list
 
@@ -112,6 +109,7 @@ class NasModel:
         :param model_config: model configuration class
         :param prev_index: previous netowrk index
         """
+        self.warm_start = False
         self.cfg = cfg
         self.logger = get_logger('NasModel', cfg.LOG_FILE)
         self.model_config = model_config
@@ -157,13 +155,17 @@ class NasModel:
         :param train_times: train times of prevous model
         :param loss_list: loss list information
         """
-        self.transformation_record = self.transformation_record.append(
-            {'prev': prev, 'current': current, 'train_times': train_times}, ignore_index=True)
+        # self.transformation_record = self.transformation_record.append(
+        #     {'prev': prev, 'current': current, 'train_times': train_times}, ignore_index=True)
+        self.transformation_record = pandas.concat([self.transformation_record,
+                                                    pd.DataFrame(
+                                                        {'prev': prev, 'current': current, 'train_times': train_times},
+                                                        index=[self.transformation_record.shape[0]])])
         self.loss_list = copy.deepcopy(loss_list)
 
     def update_global_information(self):
         """
-        update information in SQLite. todo handle pruning operation
+        update information in SQLite.
         """
         global total_model_count
         if total_model_count is None:
@@ -193,14 +195,22 @@ class NasModel:
         :return: None
         """
         optimizer = self._get_optimizer()
+        scheduler = torch.optim.lr_scheduler.ExponentialLR(optimizer, 0.995, self.train_times)
         loss_fn = self._get_loss_function()
         dataloader = DataLoader(TensorDataset(X_train, y_train),
                                 self.cfg.NASConfig['BATCH_SIZE'],
                                 shuffle=True)
-        for i in range(self.cfg.NASConfig['IterationEachTime']):
+        epochs = self.cfg.NASConfig['IterationEachTime']
+        # if self.warm_start:
+        #     self.warm_start = False
+        #     epochs = self.cfg.NASConfig['WarmUpEpoch']
+
+        for i in range(epochs):
             # Compute prediction and loss
             st = time.time()
             loss_list = []
+            # model_save = self.model_instance todo may use torchscript in the future
+            # self.model_instance = torch.jit.script(self.model_instance)
             for step, (batch_x, batch_y) in enumerate(dataloader):
                 pred = self.model_instance(batch_x)
                 pred = pred.view(-1)
@@ -209,14 +219,19 @@ class NasModel:
                 optimizer.zero_grad()
                 loss.backward()
                 optimizer.step()
+                scheduler.step()
                 loss_list.append(loss.item())
+            # self.model_instance = model_save
             self.train_times += 1
             self.loss_list.append(np.mean(loss_list))
             if self.train_times % self.cfg.NASConfig['MonitorIterations'] == 0:
-                self.logger.info(f'NasModel {self.index} '
-                                 f'train {self.train_times} times '
-                                 f'loss {loss.item()} batch: {len(loss_list)} * {self.cfg.NASConfig["BATCH_SIZE"]} '
-                                 f'{self.cfg.NASConfig["IterationEachTime"]} epoch time: {(time.time() - st) * self.cfg.NASConfig["IterationEachTime"]} sec.')
+                try:
+                    self.logger.info(f'NasModel {self.index} '
+                                     f'train {self.train_times} times '
+                                     f'loss {loss.item()} batch: {len(loss_list)} * {self.cfg.NASConfig["BATCH_SIZE"]} '
+                                     f'{self.cfg.NASConfig["IterationEachTime"]} epoch time: {(time.time() - st) * self.cfg.NASConfig["IterationEachTime"]} sec.')
+                except:
+                    pass  # ignore logger exception
 
     def test(self, X_test, y_test):
         """
@@ -290,6 +305,8 @@ class NasModel:
         """
         self.to_cpu()
         insert_type, insert_index = deeper_action
+        if type(insert_type) != str:
+            insert_type = self.cfg.NASConfig['editable'][insert_type]
         model_config = copy.deepcopy(self.model_config)
         module_instances = []
         module_length = len(model_config.modules)
@@ -298,7 +315,7 @@ class NasModel:
             if i == insert_index:
                 # insert layer inside the network
                 input_shape = self.model_config.modules[i].input_shape
-                identity_module = self.model_config.modules[i].identity_module(self.cfg, insert_type, input_shape)
+                identity_module = self.cfg.modulesCls[insert_type].identity_module(self.cfg, insert_type, input_shape)
                 module_instances.append(identity_module)
                 module_instances.append(self.activate())
 
@@ -308,7 +325,7 @@ class NasModel:
         # insert in tail
         if insert_index == module_length:
             input_shape = self.model_config.modules[-1].output_shape
-            identity_module = self.model_config.modules[i].identity_module(self.cfg, insert_type, input_shape)
+            identity_module = self.cfg.modulesCls[insert_type].identity_module(self.cfg, insert_type, input_shape)
             module_instances.append(identity_module)
             module_instances.append(self.activate())
         model_config.modules.insert(insert_index, identity_module)
@@ -320,7 +337,7 @@ class NasModel:
         m.add_transformation_record(self.index, m.index, self.train_times, self.loss_list)
         return m
 
-    def save_pred_result(self, X_test, y_test,model_dir=None):
+    def save_pred_result(self, X_test, y_test, model_dir=None):
         """
         save prediction result to disk
         :param X_test: input features
@@ -389,10 +406,15 @@ class NasModel:
     def prune(self):
         """
         Prune structure by importance score.
+        :return: new NasModel with deeper layers
         """
+        model_config = copy.deepcopy(self.model_config)
+        module_instances = []
+        module_length = len(model_config.modules)
+
         # get all modules' importance score
-        modules = self.model_config.modules
-        prune_list = self.model_config.widenable_list
+        modules = model_config.modules
+        prune_list = model_config.widenable_list
         score_list = []
         for i in range(len(prune_list)):
             if prune_list[i]:
@@ -414,11 +436,16 @@ class NasModel:
                 modules[i + 1].perform_prune_next(mask_list[pointer])
                 pointer += 1
 
-
-
-
-
-
+        # construct new model instance
+        for i in range(module_length):
+            module_instances.append(model_config.modules[i])
+            module_instances.append(self.activate())
+        module_instances = [*module_instances, *model_config.tail_layers]
+        model_instance = torch.nn.Sequential(*module_instances)
+        m = NasModel(self.cfg, model_instance, model_config, prev_index=self.index)
+        m.transformation_record = self.transformation_record.copy()
+        m.add_transformation_record(self.index, m.index, self.train_times, self.loss_list)
+        return m
 
 
     def _get_loss_function(self):
@@ -427,7 +454,9 @@ class NasModel:
     def _get_optimizer(self):
         if self.optimizer is not None:
             return self.optimizer
-        self.optimizer = torch.optim.Adam(self.model_instance.parameters())
+
+        self.optimizer = torch.optim.Adam([{'params': self.model_instance.parameters(),
+                                            'initial_lr': 1e-3}], weight_decay=1e-4)
         return self.optimizer
 
     @staticmethod
@@ -442,8 +471,6 @@ class NasModel:
     def rmse(pred, truth):
         import torch.nn.functional as F
         return torch.sqrt(F.mse_loss(pred, truth))
-
-
 
 
 def generate_new_model_config(cfg, feature_shape, targe_shape, skeleton=None) -> ModelConfig:

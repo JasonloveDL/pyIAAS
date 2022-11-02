@@ -17,7 +17,8 @@ class NewModule(NasModule):
         self.on_param_end(input_shape)
         raise NotImplementedError()
 
-    def identity_module(self, cfg, name, input_shape: tuple):
+    @staticmethod
+    def identity_module(cfg, name, input_shape: tuple):
         # generate an identity mapping module
         raise NotImplementedError()
 

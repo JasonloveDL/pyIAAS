@@ -37,6 +37,7 @@ setuptools.setup(
         'gym',
         'matplotlib',
         'click'
+        'concurrent-log-handler'
       ],
 
 )

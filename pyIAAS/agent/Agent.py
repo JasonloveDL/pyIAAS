@@ -102,7 +102,7 @@ class Agent:
             deeper_action, deeper_prob = self.deeper_net.get_action(h_n, net.model_config.insert_length)
 
             # update selector net
-            action_onehot = torch.zeros(3)
+            action_onehot = torch.zeros(SelectorActorNet.option_number)
             action_onehot[action['action'][action_index]['select']] = 1
             action_prob = select_prob
             self.update_one_subnet(self.selector_optimizer, action_onehot, action_prob, reward[action_index])
@@ -173,6 +173,9 @@ def action_describe(cfg, action):
         insert_type = cfg.NASConfig['editable'][insert_type]
         describe += f'deeper place:\t{insert_index.item()}\n'
         describe += f'deeper insert type:\t{insert_type}\n'
+    if select == 3:  # deeper the net
+        describe += f'action:\t3 prune\n'
+        describe += f'prune ratio:\t{cfg.NASConfig["PruningRatio"]}\n'
 
     describe += f'net index:\t{action["net_index"]}\n'
     describe += 'End'.center(50, '-') + '\n'
