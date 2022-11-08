@@ -24,6 +24,11 @@ class Agent:
         self.wider_optimizer = Adam(self.wider_net.parameters())
         self.deeper_optimizer = Adam(self.deeper_net.parameters())
         self.Categorical = torch.distributions.Categorical
+        self.entropy_weight = 0.0001
+        self.discount = 0.99
+        self.rho_max = 10
+        if self.cfg.NASConfig['GPU']:
+            self.to_cuda()
 
     def to_cuda(self):
         self.wider_net.cuda()
@@ -37,120 +42,188 @@ class Agent:
         self.selector.cpu()
         self.encoder_net.cpu()
 
-    def get_action(self, net_pool):
+    def get_action(self, states):
         """
-        make decision on each network in net-pool.
-        :param net_pool: net-pool list, each network is an instance of NasModel
-        :return: action of each model
+        make decision on each state.
+        :param states: state list
+        :return: action of each state
         """
-        action, a_prob = [], []
-        if self.cfg.NASConfig['GPU']:
-            self.to_cuda()
-        for net in net_pool:
-            output, (h_n, c_n) = self.encoder_net.forward(net.model_config.token_list)
-            select_action, select_prob = self.selector.get_action(h_n, net.model_config.can_widen)
-            deeper_action, deeper_prob = self.deeper_net.get_action(h_n, net.model_config.insert_length)
-            if net.model_config.can_widen:
-                wider_action, wider_prob = self.wider_net.get_action(output, net.model_config.widenable_list)
-            else:
-                wider_action, wider_prob = None, None
-            action.append({
+        actions, policys, Qs, Vs = [], [], [], []
+        for state in states:
+            token_list, insert_length, widenable_list, index = state
+            output, (h_n, c_n) = self.encoder_net.forward(token_list)
+            select_action, select_prob, select_Q, select_V = self.selector.get_action(h_n)
+            deeper_action, deeper_prob, deeper_Q, deeper_V = self.deeper_net.get_action(h_n, insert_length)
+            wider_action, wider_prob, wider_Q, wider_V = self.wider_net.get_action(output, widenable_list)
+            actions.append({
                 'select': select_action,
                 'wider': wider_action,
                 'deeper': deeper_action,
-                'net_index': net.index
+                'net_index': index
             })
-
-            a_prob.append({
+            policys.append({
                 'select': select_prob,
                 'wider': wider_prob,
                 'deeper': deeper_prob,
             })
-        if self.cfg.NASConfig['GPU']:
-            self.to_cpu()
+            Qs.append({
+                'select': select_Q,
+                'wider': wider_Q,
+                'deeper': deeper_Q,
+            })
+            Vs.append({
+                'select': select_V,
+                'wider': wider_V,
+                'deeper': deeper_V,
+            })
+        return {'action': actions, 'policy': policys, 'Q': Qs, 'V': Vs}
 
-        return {'action': action, 'prob': a_prob}
-
-    def get_log_prob_entropy(self, a_int, a_prob):
+    def _get_log_prob_entropy(self, a_int, a_prob):
         if self.cfg.NASConfig['GPU']:
             a_int = a_int.cuda()
         dist = self.Categorical(a_prob)
         return dist.log_prob(a_int)
 
-    def update(self, reward, action, net_pool):
+    def update(self, replay_memory):
         """
-        update agent actor networks by each reward comes from previous action
-        :param reward: reward information, create by environment
-        :param action: previous action
-        :param net_pool: net-pool list
+        update agent actor networks by each reward comes from previous action todo change update method
+        :param replay_memory: trajectories and replay memory
         """
-        length = len(reward)
+        trajectories = replay_memory.get_update_memory(self.cfg.NASConfig['MaxReplayEpisode'])
+
         if self.cfg.NASConfig['GPU']:
             self.to_cuda()
-        for i in range(length):
-            # calculate immediate net output
-            net = net_pool[i]
-            action_index = None
-            for j in range(len(action['action'])):
-                if action['action'][j]['net_index'] == net.index:
-                    action_index = j
-            if action_index is None or action_index >= length:
-                continue
-            self.logger.info(action_describe(self.cfg, action["action"][action_index]))
-            output, (h_n, c_n) = self.encoder_net.forward(net.model_config.token_list)
-            select_action, select_prob = self.selector.get_action(h_n, net.model_config.can_widen)
-            deeper_action, deeper_prob = self.deeper_net.get_action(h_n, net.model_config.insert_length)
+        for trajectory in trajectories:
+            # calculate immediate net output todo finish new agent update algorithm
+            states = [i.state for i in trajectory]
+            actions = [i.action for i in trajectory]
+            old_policies = [i.policy for i in trajectory]
+            rewards = [i.reward for i in trajectory]
+            new_actions = self.get_action(states)
 
             # update selector net
-            action_onehot = torch.zeros(SelectorActorNet.option_number)
-            action_onehot[action['action'][action_index]['select']] = 1
-            action_prob = select_prob
-            self.update_one_subnet(self.selector_optimizer, action_onehot, action_prob, reward[action_index])
+            # (do nothing, wider, deeper, prune)
+            self._update_selector(self.selector_optimizer,
+                                  [i['select'] for i in actions],
+                                  [i['select'] for i in new_actions['policy']],
+                                  [i['select'] for i in old_policies],
+                                  [i['select'] for i in new_actions['Q']],
+                                  [i['select'] for i in new_actions['V']],
+                                  rewards)
 
-            # update wider net
-            if action['prob'][action_index]['wider'] is not None and net.model_config.can_widen:
-                wider_action, wider_prob = self.wider_net.get_action(output, net.model_config.widenable_list)
-                action_onehot = torch.zeros(action['prob'][action_index]['wider'].shape[0])
-                action_onehot[action['action'][action_index]['wider']] = 1
-                action_prob = wider_prob
-                self.update_one_subnet(self.wider_optimizer, action_onehot, action_prob, reward[action_index])
+            # update wider net select == 1
+            self._update_wider(self.wider_optimizer,
+                               [i['wider'] for i in actions],
+                               [i['wider'] for i in new_actions['policy']],
+                               [i['wider'] for i in old_policies],
+                               [i['wider'] for i in new_actions['Q']],
+                               [i['wider'] for i in new_actions['V']],
+                               rewards,
+                               states,
+                               [i['select'] for i in actions])
 
-            # update deeper net type module
-            action_onehot = torch.zeros(len(self.cfg.NASConfig['editable']))
-            action_onehot[action['action'][action_index]['deeper'][0]] = 1
-            action_prob = deeper_prob[0]
-            prob = self.get_log_prob_entropy(action_onehot, action_prob)
-            type_loss = (- prob * reward[action_index]).sum()
+            # update deeper net select == 2
+            self._update_deeper(self.wider_optimizer,
+                                [i['deeper'] for i in actions],
+                                [i['deeper'] for i in new_actions['policy']],
+                                [i['deeper'] for i in old_policies],
+                                [i['deeper'] for i in new_actions['Q']],
+                                [i['deeper'] for i in new_actions['V']],
+                                rewards,
+                                states,
+                                [i['select'] for i in actions])
 
-            # update deeper net index module
-            action_onehot = torch.zeros(self.cfg.NASConfig['MaxLayers'])
-            action_onehot[action['action'][action_index]['deeper'][1]] = 1
-            action_prob = deeper_prob[1]
-            prob = self.get_log_prob_entropy(action_onehot, action_prob)
-            index_loss = (- prob * reward[action_index]).sum()
-
-            # update deeper net by type and index loss
-            deeper_loss = type_loss + index_loss
-            self.deeper_optimizer.zero_grad()
-            deeper_loss.backward()
-            self.deeper_optimizer.step()
-        if self.cfg.NASConfig['GPU']:
-            self.to_cpu()
-
-    def update_one_subnet(self, optimizer, onehot_action, action_prob, reward):
+    def _calculate_loss(self, actions, policies, old_policies, Qs, Vs, rewards):
         """
         update one actor, all these actors can be updated in same scheme
-        :param optimizer: optimizer of this actor
-        :param onehot_action: one hot form of action
-        :param action_prob: action probability
-        :param reward: reward information to update
+        :param old_policies: behavior policy
+        :param actions: one hot form of action
+        :param policies: action probability
+        :param rewards: reward information to update
+        :return loss value
         """
-        prob = self.get_log_prob_entropy(onehot_action, action_prob)
-        policy_loss = - prob * reward
-        policy_loss = policy_loss.mean()
+        action_size = policies[0].size(0)
+        policy_loss, value_loss = torch.zeros(1, device=Vs[0].device), torch.zeros(1, device=Vs[0].device)
+        t = len(rewards)
+        if t == 0:  # return if no trajectory
+            return
+        Qret = torch.zeros(1, device=Vs[0].device)
+        for i in reversed(range(t)):
+            # Importance sampling weights ρ ← π(∙|s_i) / µ(∙|s_i)  todo stop here
+            rho = policies[i].detach() / old_policies[i]
+            # Qret ← r_i + γQret
+            Qret = rewards[i] + self.discount * Qret
+            # Advantage A ← Qret - V(s_i; θ)
+            A = Qret - Vs[i]
+            # Log policy log(π(a_i|s_i; θ))
+            log_prob = policies[i][actions[i]].log()
+            # g ← min(c, ρ_a_i)∙∇θ∙log(π(a_i|s_i; θ))∙A
+            single_step_policy_loss = - rho[actions[i]].clamp(max=self.rho_max) * log_prob * A.detach()
+            # bias correction
+            # g ← g + Σ_a [1 - c/ρ_a]_+∙π(a|s_i; θ)∙∇θ∙log(π(a|s_i; θ))∙(Q(s_i, a; θ) - V(s_i; θ)
+            single_step_policy_loss -= ((1 - self.rho_max / rho).clamp(min=0) * policies[i].log() * (
+                    Qs[i].detach() - Vs[i].expand_as(Qs[i]).detach())).sum()
+            # Policy update dθ ← dθ + ∂θ/∂θ∙g
+            policy_loss += single_step_policy_loss
+            # Entropy regularisation dθ ← dθ + β∙∇θH(π(s_i; θ))
+            policy_loss -= self.entropy_weight * -(policies[i].log() * policies[i]).sum()  # Sum over probabilities
+
+            # Value update dθ ← dθ - ∇θ∙1/2∙(Qret - Q(s_i, a_i; θ))^2
+            Q = Qs[i][actions[i]]
+            value_loss += ((Qret - Q) ** 2 / 2)  # Least squares loss
+
+            # Truncated importance weight ρ¯_a_i = min(1, ρ_a_i)
+            truncated_rho = rho[actions[i]].clamp(max=1)
+            # Qret ← ρ¯_a_i∙(Qret - Q(s_i, a_i; θ)) + V(s_i; θ)
+            Qret = truncated_rho * (Qret - Q.detach()) + Vs[i].detach()
+        loss = policy_loss + value_loss
+        return loss
+
+    def _step_optimizer(self, optimizer, loss):
         optimizer.zero_grad()
-        policy_loss.backward(create_graph=True)
+        loss.backward(retain_graph=True)
+        torch.nn.utils.clip_grad_norm_(optimizer.param_groups[0]['params'], 100)
         optimizer.step()
+
+    def _update_selector(self, optimizer, actions, policies, old_policies, Qs, Vs, rewards):
+        loss = self._calculate_loss(actions, policies, old_policies, Qs, Vs, rewards)
+        self._step_optimizer(optimizer, loss)
+
+    def _update_wider(self, optimizer, actions, policies, old_policies, Qs, Vs, rewards, states, selected_ops):
+        wider_ops = torch.tensor(selected_ops) == SelectorActorNet.WIDER
+        if wider_ops.any():
+            actions_, policies_, old_policies_, Qs_, Vs_, rewards_ = [], [], [], [], [], []
+            for i in range(len(wider_ops)):
+                if wider_ops[i]:
+                    editable_list = states[i][2]
+                    actions_.append(actions[i])
+                    policies_.append(policies[i][editable_list])
+                    old_policies_.append(old_policies[i][editable_list])
+                    Qs_.append(Qs[i][editable_list])
+                    Vs_.append(Vs[i])
+                    rewards_.append(rewards[i])
+            loss = self._calculate_loss(actions_, policies_, old_policies_, Qs_, Vs_, rewards_)
+            self._step_optimizer(optimizer, loss)
+
+    def _update_deeper(self, optimizer, actions, policies, old_policies, Qs, Vs, rewards, states, selected_ops):
+        deeper_ops = torch.tensor(selected_ops) == SelectorActorNet.DEEPER
+        if deeper_ops.any():
+            loss_type = self._calculate_loss(  # type
+                [i[0] for i in actions],
+                [i[0] for i in policies],
+                [i[0] for i in old_policies],
+                [i[0] for i in Qs],
+                [i[0] for i in Vs],
+                rewards)
+            loss_index = self._calculate_loss(  # index
+                [i[1] for i in actions],
+                [i[1] for i in policies],
+                [i[1] for i in old_policies],
+                [i[1] for i in Qs],
+                [i[1] for i in Vs],
+                rewards)
+            loss = loss_type + loss_index
+            self._step_optimizer(optimizer, loss)
 
 
 def action_describe(cfg, action):

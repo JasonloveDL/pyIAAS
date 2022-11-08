@@ -3,7 +3,7 @@ from torch.distributions import Categorical
 from torch.nn import *
 
 _vocabulary = None  # save vocabulary for the whole NAS architecture, used for embedding
-
+_hidden_size = 256
 
 class Vocabulary:
 
@@ -52,6 +52,7 @@ class EncoderNet(Module):
     """
     Encoder network similar to EAS
     """
+
     def __init__(self, input_size, hidden_size, cfg):
         super().__init__()
         self.cfg = cfg
@@ -91,20 +92,26 @@ class WinderActorNet(Module):
         """
         super().__init__()
         self.cfg = cfg
-        self.winderNet = torch.nn.Sequential(
-            torch.nn.Linear(input_size, 1),
-            torch.nn.Sigmoid(),
+        self.actor = torch.nn.Sequential(
+            Linear(input_size, _hidden_size),
+            LeakyReLU(),
+            Linear(_hidden_size, 1),
+        )
+        self.critic = Sequential(
+            Linear(input_size, _hidden_size),
+            LeakyReLU(),
+            Linear(_hidden_size, 1),
         )
 
     def forward(self, features, editable):
-        output = self.winderNet(features.squeeze()).squeeze()
+        policy = self.actor(features.squeeze()).squeeze()
         # filter layers which cannot be widened
-        mask = torch.tensor([1 if editable[i] else 0 for i in range(output.shape[0])])
-        if self.cfg.NASConfig['GPU']:
-            mask = mask.cuda()
-        output = output * mask
-        output = output / (output.sum() + 1e-9)
-        return output
+        mask = torch.tensor([1 if editable[i] else 0 for i in range(policy.shape[0])], device=features.device)
+        policy = torch.softmax(policy, 0) * mask
+        policy = policy / (policy.sum() + 1e-9)
+        Q = torch.softmax(self.critic(features.squeeze()).squeeze(), 0) * mask
+        V = (Q * policy).sum()
+        return policy, Q, V
 
     def get_action(self, features, editable):
         """
@@ -113,9 +120,9 @@ class WinderActorNet(Module):
         :param editable: indicating if a layer can be widened
         :return: index of layer to be widened
         """
-        output_prob = self.forward(features, editable)
-        output = Categorical(output_prob).sample()
-        return output, output_prob
+        policy, Q, V = self.forward(features, editable)
+        action = Categorical(policy).sample()
+        return action, policy, Q, V
 
 
 class DeeperActorNet(Module):
@@ -131,70 +138,71 @@ class DeeperActorNet(Module):
         self.max_layers = max_layers
         self.decision_num = 2
         self.deeperNet = RNN(input_size, input_size, batch_first=True)
-        self.insert_type_layer = Sequential(
-            Linear(input_size, len(self.cfg.NASConfig['editable'])),
-            Sigmoid(),
-        )
-        self.insert_index_layer = Sequential(
-            Linear(input_size, max_layers, True),
-            Sigmoid(),
-        )
+        self.insert_type_layer = Linear(input_size, len(self.cfg.NASConfig['editable']))
+        self.insert_type_critic = Linear(input_size, len(self.cfg.NASConfig['editable']))
+        self.insert_index_layer = Linear(input_size, max_layers)
+        self.insert_index_critic = Linear(input_size, max_layers)
 
     def get_action(self, hn_feature: torch.Tensor, insert_length: int):
         """
         get output of deeper actor network
         :param hn_feature: last hidden states of encoder network
         :param insert_length: max index of the inserted neural layer
-        :return: layer type, insert index, new layer width
+        :return: (insert_type, insert_index), (insert_type_policy, insert_index_policy),(insert_type_Q, insert_index_Q), (insert_type_V, insert_index_V)
         """
         hn_feature = hn_feature.reshape(1, -1)
         hn_feature = torch.stack([hn_feature] * self.decision_num, 1)
-        if self.cfg.NASConfig['GPU']:
-            hn_feature = hn_feature.cuda()
         output, _ = self.deeperNet(hn_feature)
-        insert_type_prob = self.insert_type_layer(output[-1, 0, :])
-        insert_type = Categorical(insert_type_prob).sample()
-        mask = torch.tensor([1 if i < insert_length else 0 for i in range(self.max_layers)])
-        if self.cfg.NASConfig['GPU']:
-            mask = mask.cuda()
-        insert_index = self.insert_index_layer(output[:, 1, :]) * mask
-        insert_index_prob = insert_index / insert_index.sum()
-        insert_index = Categorical(insert_index_prob).sample()
-        return (insert_type, insert_index), (insert_type_prob, insert_index_prob)
+        insert_type_policy = torch.softmax(self.insert_type_layer(output[-1, 0, :]), dim=0)
+        insert_type = Categorical(insert_type_policy).sample()
+        insert_index_policy = self.insert_index_layer(output[:, 1, :])[0][:insert_length]
+        insert_index_policy = torch.softmax(insert_index_policy, 0)
+        insert_index = Categorical(insert_index_policy).sample()
+        insert_type_Q, insert_index_Q = self.insert_type_critic(output[-1, 0, :]), \
+                                        self.insert_index_critic(output[:, 1, :])[0][:insert_length]
+        insert_type_V, insert_index_V = (insert_type_Q * insert_type_policy).sum(), \
+                                        (insert_index_Q * insert_index_policy).sum()
+        return (insert_type, insert_index), (insert_type_policy, insert_index_policy), (
+        insert_type_Q, insert_index_Q), (insert_type_V, insert_index_V)
 
 
 class SelectorActorNet(Module):
     option_number = 4
+    UNCHANGE = 0
+    WIDER = 1
+    DEEPER = 2
+    PRUNE = 3
+
     def __init__(self, cfg, input_size):
         """
-        selector network, output is 3 dimension:
-        3 dim:
-        (do nothing, wider, deeper)
+        selector network, output is 4 dimension:
+        4 dim:
+        (do nothing, wider, deeper, prune)
         :param cfg: global configuration
         :param input_size: input data size, determined by encoder output size
         """
         super().__init__()
         self.cfg = cfg
-        self.net = Sequential(
-            Linear(input_size, 128),
+        self.actor = Sequential(
+            Linear(input_size, _hidden_size),
             LeakyReLU(),
-            Linear(128, self.option_number),
-            Sigmoid(),
+            Linear(_hidden_size, self.option_number),
         )
-        # self.no_widen_mask = torch.tensor([1, 0, 1])
-        # if self.cfg.NASConfig['GPU']:
-        #     self.no_widen_mask = self.no_widen_mask.cuda()
+        self.critic = Sequential(
+            Linear(input_size, _hidden_size),
+            LeakyReLU(),
+            Linear(_hidden_size, self.option_number),
+        )
 
     def forward(self, x):
         x = torch.flatten(x)
-        out = self.net(x)
-        return out
+        policy = self.actor(x)
+        policy = torch.softmax(policy, 0)
+        Q = self.critic(x)
+        V = (Q * policy).sum()  # V is expectation of Q under policy π
+        return policy, Q, V
 
-    def get_action(self, x, can_widen):
-        x = torch.flatten(x)
-        prob = self.net(x)
-        # if not can_widen:  # do not make widen action when not layer can widen
-        #     prob = prob * self.no_widen_mask
-        prob = prob / prob.sum()
-        action = Categorical(prob).sample()
-        return action, prob
+    def get_action(self, x):
+        policy, Q, V = self.forward(x)
+        action = Categorical(policy).sample()
+        return action, policy, Q, V

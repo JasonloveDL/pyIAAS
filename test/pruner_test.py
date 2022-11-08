@@ -1,3 +1,4 @@
+import itertools
 import unittest
 
 from pyIAAS import *
@@ -34,9 +35,10 @@ class MyTestCase(unittest.TestCase):
         skeleton_list = [  # prune structure to test
             ['lstm', 'lstm'],
         ]
-        # type_list = ['dense', 'rnn', 'conv','lstm']
-        # skeleton_list = list(itertools.product(type_list, type_list))
-        # skeleton_list = [list(i) for i in skeleton_list]
+        type_list = ['dense', 'rnn', 'conv', 'lstm']
+        # type_list = ['rnn', 'lstm']
+        skeleton_list = list(itertools.product(type_list, type_list))
+        skeleton_list = [list(i) for i in skeleton_list]
 
         prune_loop_times = 3
         for skeleton in skeleton_list:
@@ -58,6 +60,17 @@ class MyTestCase(unittest.TestCase):
                     loss_after = model_raw.test(X_test, y_test)
                     print(f'after pruning: {model_raw}')
                     print(f'{device} before prune:{loss_prev}\t after prune:{loss_after}')
+                    print(f'module list:{[str(i) for i in model_raw.model_config.modules]}')
+                    for i in range(len(model_raw.model_config.modules)):
+                        if i == 0:
+                            continue
+                        # second dimension keep unchanged
+                        assert model_raw.model_config.modules[i].output_shape[0] == \
+                               model_raw.model_config.modules[i - 1].output_shape[0] \
+                               == model_raw.model_config.modules[i].input_shape[0] == \
+                               model_raw.model_config.modules[i - 1].input_shape[0]
+                        assert model_raw.model_config.modules[i - 1].output_shape[1] == \
+                               model_raw.model_config.modules[i].input_shape[1]
 
 
 if __name__ == '__main__':

@@ -2,7 +2,7 @@ import pyIAAS
 
 # set the basic information of the searching process
 config_file = 'NASConfig.json'
-input_file = 'ME_autumn.csv'
+input_file = 'VT_summer.csv'
 target_name = 'RT_Demand'
 test_ratio = 0.2  # the proportion of the test dataset in the whole dataset. It can be adjusted by users themself for specific tasks
 pyIAAS.set_seed(44)

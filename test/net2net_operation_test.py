@@ -34,3 +34,15 @@ class MyTestCase(unittest.TestCase):
                 print(f'mean difference :{diff}')
                 print(f'mean percent_diff :{percent_diff}')
                 self.assertTrue(abs(diff) < 1e-3)  # add assertion here
+                model_raw = wider_model
+                print(f'module list:{[str(i) for i in model_raw.model_config.modules]}')
+                for i in range(len(model_raw.model_config.modules)):
+                    if i == 0:
+                        continue
+                    # second dimension keep unchanged
+                    assert model_raw.model_config.modules[i].output_shape[0] == \
+                           model_raw.model_config.modules[i - 1].output_shape[0] \
+                           == model_raw.model_config.modules[i].input_shape[0] == \
+                           model_raw.model_config.modules[i - 1].input_shape[0]
+                    assert model_raw.model_config.modules[i - 1].output_shape[1] == \
+                           model_raw.model_config.modules[i].input_shape[1]

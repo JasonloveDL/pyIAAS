@@ -1,8 +1,8 @@
 import os.path
 
 from data_process import get_data_wind_power
-from pyIAAS import *
 from new_module import NewModule
+from pyIAAS import *
 
 
 def train_wind_power(data, season, place, cfg):
@@ -20,15 +20,17 @@ def train_wind_power(data, season, place, cfg):
     # create training suite
     env_ = NasEnv(cfg, cfg.NASConfig['NetPoolSize'], data)
     agent_ = Agent(cfg, 16, 50, NASConfig['MaxLayers'])
-    net_pool = env_.reset()
+    state = env_.reset()
 
     # start RL loop
     for i in range(NASConfig['EPISODE']):
-        action = agent_.get_action(net_pool)
-        net_pool, reward, done, info = env_.step(action)
-        agent_.update(reward, action, net_pool)
+        action = agent_.get_action(state)
+        # state, reward, done, info = env_.step(action)
+        # agent_.update(reward, action, state)
+
         env_.render()
-        logger_.fatal(f'episode {i} finish,\tpool {len(env_.net_pool)},\tperformance:{env_.performance()}\ttop performance:{env_.top_performance()}')
+        logger_.fatal(
+            f'episode {i} finish,\tpool {len(env_.net_pool)},\tperformance:{env_.performance()}\ttop performance:{env_.top_performance()}')
     cfg.NASConfig['OUT_DIR'] = origin_dir
 
 

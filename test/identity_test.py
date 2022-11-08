@@ -23,7 +23,8 @@ class MyTestCase(unittest.TestCase):
 
     def test_identity_conv(self):
         # test dense identity
-        for input_shape in [(4, 32), (16, 4), (32, 128)]:
+        # for input_shape in [(4, 32), (16, 4), (32, 128), (10, 168)]:
+        for input_shape in [(168, 10)]:
             conv_identity = ConvModule.identity_module(cfg, 'conv', input_shape)
             input_data = torch.randn((2, *input_shape))
             identity_out = conv_identity(input_data)

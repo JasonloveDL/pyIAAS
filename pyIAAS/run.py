@@ -1,5 +1,3 @@
-import os
-
 from pyIAAS import *
 
 
@@ -42,10 +40,10 @@ def run_search(config_file, input_file, target_name, test_ratio):
     # load configuration file
     cfg = Config(config_file)
 
-    # output dir should be newly created
-    if os.path.exists(cfg.NASConfig['OUT_DIR']) and len(os.listdir(cfg.NASConfig['OUT_DIR'])) != 0:
-        raise RuntimeError(f'output dir {cfg.NASConfig["OUT_DIR"]} exist and not empty, please clear dir or '
-                           f'give a new output dir name')
+    # output dir should be newly created todo recover
+    # if os.path.exists(cfg.NASConfig['OUT_DIR']) and len(os.listdir(cfg.NASConfig['OUT_DIR'])) != 0:
+    #     raise RuntimeError(f'output dir {cfg.NASConfig["OUT_DIR"]} exist and not empty, please clear dir or '
+    #                        f'give a new output dir name')
 
     # create cache file dir and output file dir
     cache_dir = 'cache'
@@ -64,16 +62,19 @@ def run_search(config_file, input_file, target_name, test_ratio):
     # start RL search loop
     env_ = NasEnv(cfg, cfg.NASConfig['NetPoolSize'], data)
     agent_ = Agent(cfg, 16, 50, cfg.NASConfig['MaxLayers'])
-    net_pool = env_.reset()
+    replay_memory = ReplayMemory()
+    states = env_.reset()
     st = time.time()
     for i in range(cfg.NASConfig['EPISODE']):
-        action = agent_.get_action(net_pool)
-        net_pool, reward, done, info = env_.step(action)
-        agent_.update(reward, action, net_pool)
+        action = agent_.get_action(states)
+        states, transition = env_.step(action)
+        replay_memory.record_trajectory(transition)
+        agent_.update(replay_memory)
         env_.render()
         logger_.critical(
             f'episode {i} finish,\tpool {len(env_.net_pool)},\tperformance:{env_.performance()}\ttop performance:{env_.top_performance()}')
-    logger_.critical(f'Search episode: {cfg.NASConfig["EPISODE"]}\t Best performance: {env_.top_performance()}\t Search time :{time.time() - st:.2f} seconds')
+    logger_.critical(
+        f'Search episode: {cfg.NASConfig["EPISODE"]}\t Best performance: {env_.top_performance()}\t Search time :{time.time() - st:.2f} seconds')
 
 
 def run_predict(config_file, input_file, target_name, output_dir, prediction_file):

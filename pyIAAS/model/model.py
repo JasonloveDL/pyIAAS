@@ -13,8 +13,7 @@ from torch.utils.data.dataset import TensorDataset
 
 from .module import NasModule, generate_from_skeleton, TopK
 from ..utils.logger import get_logger
-from ..utils.sql_connector import get_total_model_count, insert_new_model_config, get_prev_record, \
-    insert_new_train_result
+from ..utils.sql_connector import get_total_model_count, insert_new_model_config, insert_new_train_result
 
 total_model_count = None
 activate = torch.nn.ReLU
@@ -51,18 +50,10 @@ class ModelConfig:
         return len(self.modules) + 1
 
     @property
-    def widenable_list(self):
-        widenable = [m.widenable for m in self.modules]
+    def editable_list(self):
+        widenable = [m.editable for m in self.modules]
         widenable[-1] = False  # The last layer is not allowed to be widened
         return widenable
-
-    @property
-    def can_widen(self):
-        can_widen = False
-        for i in self.widenable_list:
-            if i:
-                can_widen = True
-        return can_widen
 
     def generate_model(self):
         """
@@ -100,7 +91,7 @@ class ModelConfig:
 
 
 class NasModel:
-    def __init__(self, cfg, model_instance: torch.nn.Module, model_config: ModelConfig, prev_index=-1):
+    def __init__(self, cfg, model_instance: torch.nn.Module, model_config: ModelConfig, train_times=0, prev_index=-1):
         """
         NAS model class, this class representing running instance of a neural network and we can do wider and deeper transformation
         in this class
@@ -114,7 +105,7 @@ class NasModel:
         self.logger = get_logger('NasModel', cfg.LOG_FILE)
         self.model_config = model_config
         self.model_instance = model_instance
-        self.train_times = 0  # record total train times
+        self.train_times = train_times  # record total train times
         self.loss_list = []
         self.test_loss_best = None
         self.test_loss_best_iteration = 0
@@ -123,9 +114,17 @@ class NasModel:
         self.prev_index = prev_index
         # save global NasModel information
         self.update_global_information()
-        self.transformation_record = pd.DataFrame({'prev': -1, 'current': self.index, 'train_times': 0}, index=[0])
+        self.transformation_record = pd.DataFrame(
+            {'prev': -1, 'current': self.index, 'train_times': 0, 'structure': str(self.model_config)}, index=[0])
         self.optimizer = None
         self.activate = activate
+
+    @property
+    def state(self):
+        return self.model_config.token_list, \
+               self.model_config.insert_length, \
+               self.model_config.editable_list, \
+               self.index
 
     def __eq__(self, other):
         return self.index == other.index
@@ -159,7 +158,10 @@ class NasModel:
         #     {'prev': prev, 'current': current, 'train_times': train_times}, ignore_index=True)
         self.transformation_record = pandas.concat([self.transformation_record,
                                                     pd.DataFrame(
-                                                        {'prev': prev, 'current': current, 'train_times': train_times},
+                                                        {'prev': prev,
+                                                         'current': current,
+                                                         'train_times': train_times,
+                                                         'structure': str(self.model_config)},
                                                         index=[self.transformation_record.shape[0]])])
         self.loss_list = copy.deepcopy(loss_list)
 
@@ -170,15 +172,16 @@ class NasModel:
         global total_model_count
         if total_model_count is None:
             total_model_count = get_total_model_count(self.cfg)
-        try:
-            total_model_count += 1
-            self.index = total_model_count
-            insert_new_model_config(self.cfg, self.index, str(self.model_config), self.prev_index)
-        except:
-            id, structure, train_time, loss, prev_index = get_prev_record(self.cfg, str(self.model_config))
-            self.index = id
-            self.prev_index = prev_index
-            total_model_count -= 1
+        # try:
+        total_model_count += 1
+        self.index = total_model_count
+        insert_new_model_config(self.cfg, self.index, str(self.model_config), self.prev_index)
+        # except:
+        #     id, structure, train_time, loss, prev_index = get_prev_record(self.cfg, str(self.model_config))
+        #     self.index = id
+        #     self.prev_index = -1
+        #     total_model_count -= 1
+        #     self.train_times = 0
         self.logger.info(f'create model {self.index} from {self.prev_index}, structure: {self.model_config}')
 
     def __call__(self, x):
@@ -291,7 +294,7 @@ class NasModel:
             i += 1
         module_instances = [*module_instances, *model_config.tail_layers]
         model_instance = torch.nn.Sequential(*module_instances)
-        m = NasModel(self.cfg, model_instance, model_config, self.index)
+        m = NasModel(self.cfg, model_instance, model_config, self.train_times, self.index)
         m.transformation_record = self.transformation_record.copy()
         m.add_transformation_record(self.index, m.index, self.train_times, self.loss_list)
         return m
@@ -332,7 +335,7 @@ class NasModel:
 
         module_instances = [*module_instances, *model_config.tail_layers]
         model_instance = torch.nn.Sequential(*module_instances)
-        m = NasModel(self.cfg, model_instance, model_config, prev_index=self.index)
+        m = NasModel(self.cfg, model_instance, model_config, self.train_times, self.index)
         m.transformation_record = self.transformation_record.copy()
         m.add_transformation_record(self.index, m.index, self.train_times, self.loss_list)
         return m
@@ -414,7 +417,7 @@ class NasModel:
 
         # get all modules' importance score
         modules = model_config.modules
-        prune_list = model_config.widenable_list
+        prune_list = model_config.editable_list
         score_list = []
         for i in range(len(prune_list)):
             if prune_list[i]:
@@ -442,11 +445,10 @@ class NasModel:
             module_instances.append(self.activate())
         module_instances = [*module_instances, *model_config.tail_layers]
         model_instance = torch.nn.Sequential(*module_instances)
-        m = NasModel(self.cfg, model_instance, model_config, prev_index=self.index)
+        m = NasModel(self.cfg, model_instance, model_config, self.train_times, self.index)
         m.transformation_record = self.transformation_record.copy()
         m.add_transformation_record(self.index, m.index, self.train_times, self.loss_list)
         return m
-
 
     def _get_loss_function(self):
         return self.rmse

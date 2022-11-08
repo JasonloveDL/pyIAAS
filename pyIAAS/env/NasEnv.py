@@ -35,37 +35,46 @@ class NasEnv(gym.Env):
     def step(self, action: Any):
         """
         do the actions given by agent and train the networks in pool, then drop low performance networks.
+        :param replay_memory: memory to store trajectories
         :param action: action given by agent
         :return: observation, reward, done, info
         """
         net_pool = []
+        transition = {}
         for i in range(len(self.net_pool)):
             net = self.net_pool[i]
+            if net.train_times >= self.cfg.NASConfig['MaxTrainTimes']:
+                # done
+                # record nothing
+                continue
             action_i = action['action'][i]
             select = action_i['select']
-            if net.train_times < 1000:
-                net_pool.append(net)
-                self.logger.info(f"net index {i}-{net.index} : continue training({net.train_times})")
+            prev_net = net
+            transition[net] = {}
             # select representations
             if select == 0:  # do nothing
+                net_pool.append(net)
                 self.logger.info(f"net index {i}-{net.index} :do not change network")
-                continue
-            if select == 1:  # wider the net
+            elif select == 1:  # wider the net
                 self.logger.info(f"net index {i}-{net.index} :wider the net")
                 net = net.perform_wider_transformation(action_i['wider'])
                 net_pool.append(net)
-                continue
-            if select == 2:  # deeper the net
+            elif select == 2:  # deeper the net
                 self.logger.info(f"net index {i}-{net.index} :deeper the net")
                 net = net.perform_deeper_transformation(action_i['deeper'])
                 if len(net.model_config.modules) <= self.cfg.NASConfig['MaxLayers']:  # constrain the network's depth
                     net_pool.append(net)
-                continue
-            if select == 3:  # prune the net
+            elif select == 3:  # prune the net
                 self.logger.info(f"net index {i}-{net.index} :prune the net")
                 net = net.prune()
                 net_pool.append(net)
-                continue
+            else:
+                raise RuntimeError(f'no such action type: {select}')
+            # record transition
+            transition[prev_net]['next net'] = net
+            transition[prev_net]['action'] = action['action'][i]  # todo 完成record
+            transition[prev_net]['policy'] = action['policy'][i]
+
         self.net_pool = net_pool
         X_train, y_train, X_test, y_test = self.train_test_data
         feature_shape = X_train.shape[1:]
@@ -75,12 +84,13 @@ class NasEnv(gym.Env):
         self.net_pool = list(set(self.net_pool))
         self._train_and_test()
         self.net_pool = sorted(self.net_pool, key=lambda x: x.test_loss)
+        reward_dict = self.get_reward()
+        for i in transition.keys():
+            transition[i]['reward'] = reward_dict[transition[i]['next net']]
+
         self.net_pool = self.net_pool[:self.pool_size]
-        observation = self.net_pool
-        reward = self.get_reward()
-        done = True
-        info = {}
-        return observation, reward, done, info
+        state = [i.state for i in self.net_pool]
+        return state, transition
 
     def performance(self):
         """
@@ -99,10 +109,10 @@ class NasEnv(gym.Env):
         calculate reward for each network
         :return:
         """
-        reward = []
+        reward_dict = {}
         for net in self.net_pool:
-            reward.append(1 / net.test_loss)
-        return reward
+            reward_dict[net] = (1 / net.test_loss)
+        return reward_dict
 
     def reset(self):
         """
@@ -116,7 +126,7 @@ class NasEnv(gym.Env):
         self.net_pool = [generate_new_model_config(self.cfg, feature_shape,1, [i]).generate_model() for i in  self.cfg.modulesConfig.keys()]
         self._train_and_test()
         self.render()
-        return self.net_pool
+        return [i.state for i in self.net_pool]
 
     def render(self, mode='human'):
         """

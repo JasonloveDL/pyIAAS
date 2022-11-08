@@ -27,7 +27,7 @@ class NasModule(nn.Module):
         self.name = name
         self.output_shape = None
         self.params = None
-        self.widenable = self.cfg.modulesConfig[name]['editable']
+        self.editable = self.cfg.modulesConfig[name]['editable']
         self._module_instance = None  # buffer the instance
         self.current_level = None  # current width level
         self.widen_sample_fn = self.default_sample_strategy
@@ -329,7 +329,7 @@ class RNNModule(NasModule):
             (self._module_instance.rnn_unit.weight_hh_l0[:, mapping_g] * scale_g)[mapping_g], True)
         self.current_level = next_level
         self._module_instance = new_module_instance
-        self.output_shape = (self.current_level, self.output_shape[1])
+        self.output_shape = (self.output_shape[0], self.current_level)
         self.params['output_size'] = self.current_level
         if self.cfg.NASConfig['Pruning']:
             self.importance_score = Parameter(self.importance_score[mapping_g])
@@ -355,7 +355,7 @@ class RNNModule(NasModule):
             nn.Parameter(self._module_instance.rnn_unit.weight_hh_l0,
                          requires_grad=True)
         self._module_instance = new_module_instance
-        self.input_shape = (next_level, self.input_shape[1])
+        self.input_shape = (self.input_shape[0], next_level)
         self.params['input_size'] = next_level
 
     def perform_prune_current(self, mask):
@@ -383,7 +383,7 @@ class RNNModule(NasModule):
         rnn.flatten_parameters()
 
         self._module_instance = new_module_instance
-        self.output_shape = (self.current_level, self.output_shape[1])
+        self.output_shape = (self.output_shape[0], self.current_level)
         self.params['output_size'] = self.current_level
         self.importance_score = nn.Parameter(self.importance_score[mask])
 
@@ -405,7 +405,7 @@ class RNNModule(NasModule):
         # make all parameters compact
         rnn.flatten_parameters()
         self._module_instance = new_module_instance
-        self.input_shape = (input_size, self.input_shape[1])
+        self.input_shape = (self.input_shape[0], input_size)
         self.params['input_size'] = input_size
 
 
@@ -727,7 +727,7 @@ class LSTMModule(NasModule):
             torch.cat(tuple(map(lambda x: x[mask], self._module_instance.cell.bias_ih.chunk(4)))))
 
         self._module_instance = new_module_instance
-        self.output_shape = (self.current_level, self.output_shape[1])
+        self.output_shape = (self.output_shape[0], self.current_level)
         self.params['output_size'] = self.current_level
         self.importance_score = nn.Parameter(self.importance_score[mask])
 
@@ -740,7 +740,7 @@ class LSTMModule(NasModule):
 
         self._module_instance = new_module_instance
 
-        self.input_shape = (input_size, self.input_shape[1])
+        self.input_shape = (self.input_shape[0], input_size)
         self.params['input_size'] = input_size
 
     @property
@@ -862,7 +862,7 @@ class LSTMModule(NasModule):
             torch.cat(tuple(map(lambda x: x[mapping_g], self._module_instance.cell.bias_ih.chunk(4)))))
         self.current_level = next_level
         self._module_instance = new_module_instance
-        self.output_shape = (self.current_level, self.output_shape[1])
+        self.output_shape = (self.output_shape[0], self.current_level)
         self.params['output_size'] = self.current_level
         if self.cfg.NASConfig['Pruning']:
             self.importance_score = Parameter(self.importance_score[mapping_g])
@@ -877,7 +877,7 @@ class LSTMModule(NasModule):
         new_module_instance.cell.weight_hh = nn.Parameter(self._module_instance.cell.weight_hh)
         new_module_instance.cell.bias_ih = nn.Parameter(self._module_instance.cell.bias_ih)
         self._module_instance = new_module_instance
-        self.input_shape = (next_level, self.input_shape[1])
+        self.input_shape = (self.input_shape[0], next_level)
         self.params['input_size'] = next_level
 
 
