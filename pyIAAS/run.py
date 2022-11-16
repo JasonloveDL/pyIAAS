@@ -21,29 +21,27 @@ def set_seed(seed):
     random.seed(seed)
 
 
-def run_search(config_file, input_file, target_name, test_ratio):
+def run_search(config, input_file, target_name, test_ratio):
     """
     Start point of pyIAAS framework, this function will process and read data
     create output directory and trigger the RL loop to search in the network space
     :param test_ratio: test data ration, float value in range (0,1)
-    :param config_file: configuration file path, can be either absolute or relative to working directory
+    :param config: configuration file path(can be either absolute or relative to working directory) or Config object
     :param input_file: input csv file, all the column should be features and target name should be included in one feature. All data should be float values
     :param target_name: target value to predict
     """
 
     # check file existence
-    if not os.path.exists(config_file):
-        raise RuntimeError(f'configuration file {config_file} does not exist')
     if not os.path.exists(input_file):
-        raise RuntimeError(f'configuration file {input_file} does not exist')
+        raise RuntimeError(f'input data file {input_file} does not exist')
 
     # load configuration file
-    cfg = Config(config_file)
-
-    # output dir should be newly created todo recover
-    # if os.path.exists(cfg.NASConfig['OUT_DIR']) and len(os.listdir(cfg.NASConfig['OUT_DIR'])) != 0:
-    #     raise RuntimeError(f'output dir {cfg.NASConfig["OUT_DIR"]} exist and not empty, please clear dir or '
-    #                        f'give a new output dir name')
+    if isinstance(config, str):
+        if not os.path.exists(config):
+            raise RuntimeError(f'configuration file {config} does not exist')
+        cfg = Config(config)
+    else:
+        cfg = config
 
     # create cache file dir and output file dir
     cache_dir = 'cache'
@@ -64,11 +62,13 @@ def run_search(config_file, input_file, target_name, test_ratio):
     agent_ = Agent(cfg, 16, 50, cfg.NASConfig['MaxLayers'])
     replay_memory = ReplayMemory()
     states = env_.reset()
+    replay_memory.load_memories(cfg.NASConfig['OUT_DIR'])
     st = time.time()
     for i in range(cfg.NASConfig['EPISODE']):
         action = agent_.get_action(states)
         states, transition = env_.step(action)
         replay_memory.record_trajectory(transition)
+        replay_memory.save_memories(cfg.NASConfig['OUT_DIR'])
         agent_.update(replay_memory)
         env_.render()
         logger_.critical(

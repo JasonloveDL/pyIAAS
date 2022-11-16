@@ -19,10 +19,10 @@ class Agent:
         self.encoder_net = EncoderNet(input_size, hidden_size, cfg)
         self.wider_net = WinderActorNet(self.cfg, hidden_size * 2)
         self.deeper_net = DeeperActorNet(self.cfg, hidden_size * 2, max_layers)
-        self.selector = SelectorActorNet(self.cfg, hidden_size * 2)
-        self.selector_optimizer = Adam(self.selector.parameters())
-        self.wider_optimizer = Adam(self.wider_net.parameters())
-        self.deeper_optimizer = Adam(self.deeper_net.parameters())
+        self.selector_net = SelectorActorNet(self.cfg, hidden_size * 2)
+        self.selector_optimizer = Adam(self.selector_net.parameters(), weight_decay=1e-4)
+        self.wider_optimizer = Adam(self.wider_net.parameters(), weight_decay=1e-4)
+        self.deeper_optimizer = Adam(self.deeper_net.parameters(), weight_decay=1e-4)
         self.Categorical = torch.distributions.Categorical
         self.entropy_weight = 0.0001
         self.discount = 0.99
@@ -33,13 +33,13 @@ class Agent:
     def to_cuda(self):
         self.wider_net.cuda()
         self.deeper_net.cuda()
-        self.selector.cuda()
+        self.selector_net.cuda()
         self.encoder_net.cuda()
 
     def to_cpu(self):
         self.wider_net.cpu()
         self.deeper_net.cpu()
-        self.selector.cpu()
+        self.selector_net.cpu()
         self.encoder_net.cpu()
 
     def get_action(self, states):
@@ -52,7 +52,7 @@ class Agent:
         for state in states:
             token_list, insert_length, widenable_list, index = state
             output, (h_n, c_n) = self.encoder_net.forward(token_list)
-            select_action, select_prob, select_Q, select_V = self.selector.get_action(h_n)
+            select_action, select_prob, select_Q, select_V = self.selector_net.get_action(h_n)
             deeper_action, deeper_prob, deeper_Q, deeper_V = self.deeper_net.get_action(h_n, insert_length)
             wider_action, wider_prob, wider_Q, wider_V = self.wider_net.get_action(output, widenable_list)
             actions.append({
@@ -103,6 +103,7 @@ class Agent:
 
             # update selector net
             # (do nothing, wider, deeper, prune)
+            print('update start')
             self._update_selector(self.selector_optimizer,
                                   [i['select'] for i in actions],
                                   [i['select'] for i in new_actions['policy']],
@@ -123,7 +124,7 @@ class Agent:
                                [i['select'] for i in actions])
 
             # update deeper net select == 2
-            self._update_deeper(self.wider_optimizer,
+            self._update_deeper(self.deeper_optimizer,
                                 [i['deeper'] for i in actions],
                                 [i['deeper'] for i in new_actions['policy']],
                                 [i['deeper'] for i in old_policies],
@@ -182,7 +183,8 @@ class Agent:
     def _step_optimizer(self, optimizer, loss):
         optimizer.zero_grad()
         loss.backward(retain_graph=True)
-        torch.nn.utils.clip_grad_norm_(optimizer.param_groups[0]['params'], 100)
+        norm = torch.nn.utils.clip_grad_norm_(optimizer.param_groups[0]['params'], 100, error_if_nonfinite=True)
+        print(f'norm:{norm.item()}')
         optimizer.step()
 
     def _update_selector(self, optimizer, actions, policies, old_policies, Qs, Vs, rewards):

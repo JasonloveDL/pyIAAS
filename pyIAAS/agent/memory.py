@@ -1,4 +1,6 @@
 # -*- coding: utf-8 -*-
+import os.path
+import pickle
 import random
 from collections import deque, namedtuple
 
@@ -55,6 +57,19 @@ class ReplayMemory():
             for k in existing_keys:
                 trajectory = self.trajectories.pop(k)
                 self.memory.append(trajectory)
+
+    def save_memories(self, save_dir):
+        path = os.path.join(save_dir, 'replay_memory.pkl')
+        with open(path, 'wb') as f:
+            pickle.dump(self.memory, f)
+
+    def load_memories(self, save_dir):
+        path = os.path.join(save_dir, 'replay_memory.pkl')
+        if not os.path.exists(path):
+            return
+        with open(path, 'rb') as f:
+            self.memory = pickle.load(f)
+        print(f'load memory :{len(self.memory)}')
 
 
 def recursive_tensor_detach(data):
