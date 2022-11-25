@@ -1,11 +1,14 @@
+import copy
 import os
+import pickle
 import random
-from typing import Any
+from typing import Any, List
 
 import gym
 import numpy as np
 
-from ..model import generate_new_model_config, reset_model_count
+from ..agent import SelectorActorNet, Transition, recursive_tensor_detach
+from ..model import generate_new_model_config, reset_model_count, NasModel
 from ..utils.logger import get_logger
 
 
@@ -26,7 +29,6 @@ class NasEnv(gym.Env):
         self.pool_size = pool_size
         self.best_performance = 1e9  # record best performance
         self.global_train_times = 0
-        self.no_enhancement_episodes = 0  # record episodes that no enhancement of  prediction performance
         if self.cfg.NASConfig['GPU']:
             self.train_test_data = []
             for i in range(len(train_test_data)):
@@ -39,8 +41,13 @@ class NasEnv(gym.Env):
         :param action: action given by agent
         :return: observation, reward, done, info
         """
-        net_pool = []
-        transition = {}
+        net_pool: List[NasModel] = []
+        transition: List[dict] = []
+
+        # remove all model from pool
+        for net in self.net_pool:
+            net.update_pool_state(False)
+
         for i in range(len(self.net_pool)):
             net = self.net_pool[i]
             if net.train_times >= self.cfg.NASConfig['MaxTrainTimes']:
@@ -50,32 +57,44 @@ class NasEnv(gym.Env):
             action_i = action['action'][i]
             select = action_i['select']
             prev_net = net
-            transition[net] = {}
+
+            # add prev net
+            net_pool.append(prev_net)
+            transition_item = {}
+            transition_item['prev net'] = prev_net
+            transition_item['next net'] = prev_net
+            transition_item['action'] = copy.deepcopy(action['action'][i])
+            transition_item['action']['select'] = SelectorActorNet.UNCHANGE
+            transition_item['policy'] = action['policy'][i]
+            transition.append(transition_item)
+
             # select representations
-            if select == 0:  # do nothing
-                net_pool.append(net)
-                self.logger.info(f"net index {i}-{net.index} :do not change network")
-            elif select == 1:  # wider the net
-                self.logger.info(f"net index {i}-{net.index} :wider the net")
+            if select == SelectorActorNet.UNCHANGE:  # do nothing
+                self.logger.info(f"net index {i}-{net.index} :do not change network {net}")
+                continue
+            elif select == SelectorActorNet.WIDER:  # wider the net
+                self.logger.info(f"net index {i}-{net.index} :wider the net {net}")
                 net = net.perform_wider_transformation(action_i['wider'])
-                net_pool.append(net)
-            elif select == 2:  # deeper the net
-                self.logger.info(f"net index {i}-{net.index} :deeper the net")
+            elif select == SelectorActorNet.DEEPER:  # deeper the net
+                self.logger.info(f"net index {i}-{net.index} :deeper the net {net}")
                 net = net.perform_deeper_transformation(action_i['deeper'])
-                if len(net.model_config.modules) <= self.cfg.NASConfig['MaxLayers']:  # constrain the network's depth
-                    net_pool.append(net)
-            elif select == 3:  # prune the net
-                self.logger.info(f"net index {i}-{net.index} :prune the net")
+                if len(net.model_config.modules) > self.cfg.NASConfig['MaxLayers']:  # constrain the network's depth
+                    continue
+            elif select == SelectorActorNet.PRUNE:  # prune the net
+                self.logger.info(f"net index {i}-{net.index} :prune the net {net}")
                 net = net.prune()
-                net_pool.append(net)
             else:
                 raise RuntimeError(f'no such action type: {select}')
-            # record transition
-            transition[prev_net]['next net'] = net
-            transition[prev_net]['action'] = action['action'][i]  # todo 完成record
-            transition[prev_net]['policy'] = action['policy'][i]
-
+            net_pool.append(net)
+            transition_item = {}
+            transition_item['prev net'] = prev_net
+            transition_item['next net'] = net
+            transition_item['action'] = action['action'][i]
+            transition_item['policy'] = action['policy'][i]
+            transition.append(transition_item)
         self.net_pool = net_pool
+        for net in self.net_pool:
+            net.update_pool_state(True)
         X_train, y_train, X_test, y_test = self.train_test_data
         feature_shape = X_train.shape[1:]
         base_structure = [[i] for i in self.cfg.modulesList]
@@ -85,12 +104,22 @@ class NasEnv(gym.Env):
         self._train_and_test()
         self.net_pool = sorted(self.net_pool, key=lambda x: x.test_loss)
         reward_dict = self.get_reward()
-        for i in transition.keys():
-            transition[i]['reward'] = reward_dict[transition[i]['next net']]
-
+        for i in transition:
+            i['reward'] = reward_dict[i['next net']]
+            t = i['prev net'].state, i['action'], i['reward'], i['policy']
+            t = recursive_tensor_detach(t)
+            i['next net'].transitions.append(Transition(*t))
+        in_pool_trajectory, finished_trajectory = [], []
+        for i in range(len(self.net_pool)):
+            if i < self.pool_size:
+                in_pool_trajectory.append(self.net_pool[i].transitions)
+                self.net_pool[i].update_pool_state(True)
+            else:
+                finished_trajectory.append(self.net_pool[i].transitions)
+                self.net_pool[i].update_pool_state(False)
         self.net_pool = self.net_pool[:self.pool_size]
-        state = [i.state for i in self.net_pool]
-        return state, transition
+        state = self.get_state()
+        return state, in_pool_trajectory, finished_trajectory
 
     def performance(self):
         """
@@ -111,7 +140,8 @@ class NasEnv(gym.Env):
         """
         reward_dict = {}
         for net in self.net_pool:
-            reward_dict[net] = (1 / net.test_loss)
+            reward_dict[net] = (1 / net.test_loss) * (
+                        1 - self.cfg.NASConfig['RewardRegularisation'] * net.flop_change_ratio)
         return reward_dict
 
     def reset(self):
@@ -123,9 +153,13 @@ class NasEnv(gym.Env):
         reset_model_count()
         X_train, y_train, X_test, y_test = self.train_test_data
         feature_shape = X_train.shape[1:]
-        self.net_pool = [generate_new_model_config(self.cfg, feature_shape,1, [i]).generate_model() for i in  self.cfg.modulesConfig.keys()]
+        self.net_pool = [generate_new_model_config(self.cfg, feature_shape, 1, [i]).generate_model() for i in
+                         self.cfg.modulesConfig.keys()]
         self._train_and_test()
         self.render()
+        return self.get_state()
+
+    def get_state(self):
         return [i.state for i in self.net_pool]
 
     def render(self, mode='human'):
@@ -162,3 +196,18 @@ class NasEnv(gym.Env):
             net.train(X_train, y_train)
             net.test(X_test, y_test)
         self.render()  # save train result
+
+    def save(self, path=None):
+        path = os.path.join(self.cfg.NASConfig['OUT_DIR'], 'env.pkl') if path is None else path
+        with open(path, 'wb') as f:
+            pickle.dump(self, f)
+
+    @staticmethod
+    def try_load(cfg, logger, path=None):
+        path = os.path.join(cfg.NASConfig['OUT_DIR'], 'env.pkl') if path is None else path
+        if not os.path.exists(path):
+            return None
+        with open(path, 'rb') as f:
+            env = pickle.load(f)
+            logger.critical('load env checkpoint')
+            return env

@@ -83,15 +83,17 @@ def get_predict_data(input_file, target_name, time_length: int) -> (np.ndarray, 
     return X
 
 
-def train_test_split(x, y, test_ratio: float):
+def train_test_split(x, y, test_ratio_or_size):
     """
-    split the whole dataset into train and test datasets and test dataset contains test_ration of whole dataset
+    If test_ratio is float in (0,1), split the whole dataset into train and test datasets and test dataset contains test_ration of whole dataset.
+    else test_ratio represent absolute size of test dataset
     :param x: feature data
     :param y: target data
-    :param test_ratio: float value in range (0, 1)
+    :param test_ratio_or_size: float value in range (0, 1), or int value of test dataset size
     :return: X_train, y_train, X_test, y_test
     """
     length = x.shape[0]
-    train_length = int(length * (1 - test_ratio))
+    train_length = int(length * (1 - test_ratio_or_size)) if isinstance(test_ratio_or_size,
+                                                                        float) else length - test_ratio_or_size
     X_train, y_train, X_test, y_test = x[:train_length], y[:train_length], x[train_length:], y[train_length:]
     return X_train, y_train, X_test, y_test

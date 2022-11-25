@@ -1,4 +1,5 @@
 from pyIAAS import *
+from pyIAAS import Config
 
 
 def set_seed(seed):
@@ -19,6 +20,26 @@ def set_seed(seed):
     np.random.seed(seed)
     import random
     random.seed(seed)
+
+
+def save_rng_states(cfg, logger, path=None):
+    cpu_state = torch.get_rng_state()
+    gpu_states = torch.cuda.get_rng_state_all()
+    path = os.path.join(cfg.NASConfig['OUT_DIR'], 'rng_state.pkl') if path is None else path
+    with open(path, 'wb') as f:
+        pickle.dump([cpu_state, gpu_states], f)
+        # logger.critical(f'save cpu and gpu rng state')
+
+
+def try_load_rng_state(cfg, logger, path=None):
+    path = os.path.join(cfg.NASConfig['OUT_DIR'], 'rng_state.pkl') if path is None else path
+    if not os.path.exists(path):
+        return None
+    with open(path, 'rb') as f:
+        cpu_state, gpu_states = pickle.load(f)
+        torch.set_rng_state(cpu_state)
+        torch.cuda.set_rng_state_all(gpu_states)
+        logger.critical(f'load cpu and gpu rng state')
 
 
 def run_search(config, input_file, target_name, test_ratio):
@@ -57,22 +78,38 @@ def run_search(config, input_file, target_name, test_ratio):
     data = [torch.tensor(i, dtype=torch.float) for i in data]
     logger_ = get_logger(f'main loop', cfg.LOG_FILE)
 
+    search_net(cfg, data, logger_)
+
+
+def search_net(cfg, data, logger_):
     # start RL search loop
-    env_ = NasEnv(cfg, cfg.NASConfig['NetPoolSize'], data)
-    agent_ = Agent(cfg, 16, 50, cfg.NASConfig['MaxLayers'])
+    env_ = NasEnv.try_load(cfg, logger_)
+    if env_ is None:
+        env_ = NasEnv(cfg, cfg.NASConfig['NetPoolSize'], data)
+        states = env_.reset()
+    else:
+        states = env_.get_state()
+    agent_ = Agent.try_load(cfg, logger_)
+    if agent_ is None:
+        agent_ = Agent(cfg, 16, 50, cfg.NASConfig['MaxLayers'])
     replay_memory = ReplayMemory()
-    states = env_.reset()
     replay_memory.load_memories(cfg.NASConfig['OUT_DIR'])
+    try_load_rng_state(cfg, logger_)
     st = time.time()
     for i in range(cfg.NASConfig['EPISODE']):
+        # try:
+        agent_.save()
+        env_.save()
+        save_rng_states(cfg, logger_)
         action = agent_.get_action(states)
-        states, transition = env_.step(action)
-        replay_memory.record_trajectory(transition)
+        states, in_pool_trajectory, finished_trajectory = env_.step(action)
+        replay_memory.record_trajectory(in_pool_trajectory, finished_trajectory)
         replay_memory.save_memories(cfg.NASConfig['OUT_DIR'])
         agent_.update(replay_memory)
-        env_.render()
         logger_.critical(
             f'episode {i} finish,\tpool {len(env_.net_pool)},\tperformance:{env_.performance()}\ttop performance:{env_.top_performance()}')
+        # except Exception as e:
+        #     logger_.fatal(f'error {e}')
     logger_.critical(
         f'Search episode: {cfg.NASConfig["EPISODE"]}\t Best performance: {env_.top_performance()}\t Search time :{time.time() - st:.2f} seconds')
 
@@ -132,5 +169,3 @@ def run_predict(config_file, input_file, target_name, output_dir, prediction_fil
         print(output)
         print(''.center(50, '='))
         logger_.info(f'save result to file: {prediction_file}')
-
-

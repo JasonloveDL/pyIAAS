@@ -22,53 +22,39 @@ class ReplayMemory():
     def __init__(self):
         # Max number of transitions possible will be the memory capacity, could be much less
         self.memory = deque()
-        self.trajectories = {}
+        self.trajectories = []
 
     # Samples random trajectory
     def get_update_memory(self, max_len=0):
         memory = []
         # add running instances
-        memory.extend(self.trajectories.values())
+        memory.extend(self.trajectories)
         # sample from memory
         if len(self.memory) <= max_len:
             memory.extend(self.memory)
         else:
             memory.extend(random.sample(self.memory, max_len))
-        return memory
+        memory_ = []
+        for i in memory:
+            if len(i) > 0:
+                memory_.append(i)
+        return memory_
 
-    def record_trajectory(self, transition):  # todo wait for test
-        existing_keys = set(self.trajectories.keys())
-        for k in transition.keys():
-            t = k.state, transition[k]['action'], transition[k]['reward'], transition[k]['policy']
-            t = recursive_tensor_detach(t)
-            t = Transition(*t)
-            if k in self.trajectories.keys():
-                # recorded network, add transition
-                existing_keys.remove(k)
-                # add new transition to previous trajectory
-                trajectory = self.trajectories.pop(k)
-                trajectory.append(t)
-                self.trajectories[transition[k]['next net']] = trajectory
-            else:
-                # new network, add new trajectory
-                self.trajectories[transition[k]['next net']] = [t]
-        # keep finished trajectory to memory
-        if len(existing_keys) > 0:
-            for k in existing_keys:
-                trajectory = self.trajectories.pop(k)
-                self.memory.append(trajectory)
+    def record_trajectory(self, in_pool_trajectory, finished_trajectory):
+        self.trajectories = in_pool_trajectory
+        self.memory.extend(finished_trajectory)
 
     def save_memories(self, save_dir):
         path = os.path.join(save_dir, 'replay_memory.pkl')
         with open(path, 'wb') as f:
-            pickle.dump(self.memory, f)
+            pickle.dump([self.memory, self.trajectories], f)
 
     def load_memories(self, save_dir):
         path = os.path.join(save_dir, 'replay_memory.pkl')
         if not os.path.exists(path):
             return
         with open(path, 'rb') as f:
-            self.memory = pickle.load(f)
+            self.memory, self.trajectories = pickle.load(f)
         print(f'load memory :{len(self.memory)}')
 
 

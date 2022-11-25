@@ -104,9 +104,9 @@ class WinderActorNet(Module):
         )
 
     def forward(self, features, editable):
-        policy = self.actor(features.squeeze()).squeeze()
+        policy = self.actor(features.squeeze(0)).squeeze()
         # filter layers which cannot be widened
-        mask = torch.tensor([1 if editable[i] else 0 for i in range(policy.shape[0])], device=features.device)
+        mask = torch.tensor(list(map(lambda x: 1 if x else 0, editable)), device=features.device)
         policy = torch.softmax(policy, 0) * mask
         policy = policy / (policy.sum() + 1e-9)
         Q = torch.softmax(self.critic(features.squeeze()).squeeze(), 0) * mask
@@ -138,10 +138,26 @@ class DeeperActorNet(Module):
         self.max_layers = max_layers
         self.decision_num = 2
         self.deeperNet = RNN(input_size, input_size, batch_first=True)
-        self.insert_type_layer = Linear(input_size, len(self.cfg.NASConfig['editable']))
-        self.insert_type_critic = Linear(input_size, len(self.cfg.NASConfig['editable']))
-        self.insert_index_layer = Linear(input_size, max_layers)
-        self.insert_index_critic = Linear(input_size, max_layers)
+        self.insert_type_layer = Sequential(
+            Linear(input_size, _hidden_size),
+            LeakyReLU(),
+            Linear(_hidden_size, len(self.cfg.NASConfig['editable'])),
+        )
+        self.insert_type_critic = Sequential(
+            Linear(input_size, _hidden_size),
+            LeakyReLU(),
+            Linear(_hidden_size, len(self.cfg.NASConfig['editable'])),
+        )
+        self.insert_index_layer = Sequential(
+            Linear(input_size, _hidden_size),
+            LeakyReLU(),
+            Linear(_hidden_size, max_layers),
+        )
+        self.insert_index_critic = Sequential(
+            Linear(input_size, _hidden_size),
+            LeakyReLU(),
+            Linear(_hidden_size, max_layers),
+        )
 
     def get_action(self, hn_feature: torch.Tensor, insert_length: int):
         """

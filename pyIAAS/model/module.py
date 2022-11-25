@@ -44,20 +44,28 @@ class NasModule(nn.Module):
         pass
 
     @property
-    @abc.abstractmethod
     def next_level(self) -> int:
         """
         :return: width of next level
         """
-        pass
+        out_range = self.cfg.modulesConfig[self.name]['out_range']
+        out_range = list(out_range)
+        valid_range = []
+        for i in out_range:
+            if i > self.current_level:
+                valid_range.append(i)
+        if len(valid_range) == 0:
+            return self.current_level
+        else:
+            return min(valid_range)
 
     def get_level(self, level_list) -> int:
         """
-        determine init level, return small level
+        determine init level, return random level
         :param level_list: all available level list
         :return: level
         """
-        return random.sample(level_list[:4], 1)[0]
+        return random.sample(level_list, 1)[0]
 
     @abc.abstractmethod
     def init_param(self, input_shape):
@@ -180,16 +188,6 @@ class RNNModule(NasModule):
     def is_max_level(self):
         out_range = self.cfg.modulesConfig['rnn']['out_range']
         return self.current_level >= max(out_range)
-
-    @property
-    def next_level(self):
-        out_range = self.cfg.modulesConfig['rnn']['out_range']
-        out_range = list(out_range)
-        valid_range = []
-        for i in out_range:
-            if i >= self.current_level:
-                valid_range.append(i)
-        return min(valid_range)
 
     def init_param(self, input_shape):
         assert len(input_shape) == 2
@@ -443,16 +441,6 @@ class DenseModule(NasModule):
         out_range = self.cfg.modulesConfig['dense']['out_range']
         return self.current_level >= max(out_range)
 
-    @property
-    def next_level(self):
-        out_range = self.cfg.modulesConfig['dense']['out_range']
-        out_range = list(out_range)
-        valid_range = []
-        for i in out_range:
-            if i >= self.current_level:
-                valid_range.append(i)
-        return min(valid_range)
-
     def init_param(self, input_shape):
         assert len(input_shape) == 2
         out_range = self.cfg.modulesConfig['dense']['out_range']
@@ -578,16 +566,6 @@ class ConvModule(NasModule):
     def is_max_level(self):
         out_range = self.cfg.modulesConfig['conv']['out_range']
         return self.current_level >= max(out_range)
-
-    @property
-    def next_level(self):
-        out_range = self.cfg.modulesConfig['conv']['out_range']
-        out_range = list(out_range)
-        valid_range = []
-        for i in out_range:
-            if i >= self.current_level:
-                valid_range.append(i)
-        return min(valid_range)
 
     def init_param(self, input_shape):
         assert len(input_shape) == 2
@@ -748,15 +726,6 @@ class LSTMModule(NasModule):
         out_range = self.cfg.modulesConfig['lstm']['out_range']
         return self.current_level >= max(out_range)
 
-    @property
-    def next_level(self):
-        out_range = self.cfg.modulesConfig['lstm']['out_range']
-        out_range = list(out_range)
-        valid_range = []
-        for i in out_range:
-            if i >= self.current_level:
-                valid_range.append(i)
-        return min(valid_range)
 
     def init_param(self, input_shape):
         assert len(input_shape) == 2

@@ -13,7 +13,8 @@ from torch.utils.data.dataset import TensorDataset
 
 from .module import NasModule, generate_from_skeleton, TopK
 from ..utils.logger import get_logger
-from ..utils.sql_connector import get_total_model_count, insert_new_model_config, insert_new_train_result
+from ..utils.sql_connector import get_total_model_count, insert_new_model_config, update_new_train_result, \
+    update_new_pool_state
 
 total_model_count = None
 activate = torch.nn.ReLU
@@ -75,7 +76,6 @@ class ModelConfig:
         module_instances = [*module_instances, *self.tail_layers]
         model_instance = torch.nn.Sequential(*module_instances)
         m = NasModel(self.cfg, model_instance, self)
-        m.warm_start = True
         return m
 
     @property
@@ -91,7 +91,8 @@ class ModelConfig:
 
 
 class NasModel:
-    def __init__(self, cfg, model_instance: torch.nn.Module, model_config: ModelConfig, train_times=0, prev_index=-1):
+    def __init__(self, cfg, model_instance: torch.nn.Module, model_config: ModelConfig, train_times=0, prev_index=-1,
+                 prev_flops=None):
         """
         NAS model class, this class representing running instance of a neural network and we can do wider and deeper transformation
         in this class
@@ -100,7 +101,6 @@ class NasModel:
         :param model_config: model configuration class
         :param prev_index: previous netowrk index
         """
-        self.warm_start = False
         self.cfg = cfg
         self.logger = get_logger('NasModel', cfg.LOG_FILE)
         self.model_config = model_config
@@ -112,12 +112,25 @@ class NasModel:
         self.test_loss = None
         self.next_save = False
         self.prev_index = prev_index
-        # save global NasModel information
         self.update_global_information()
         self.transformation_record = pd.DataFrame(
             {'prev': -1, 'current': self.index, 'train_times': 0, 'structure': str(self.model_config)}, index=[0])
+        self.transitions = []
         self.optimizer = None
         self.activate = activate
+        input_data = torch.zeros((1, *model_config.feature_shape))
+        with torch.profiler.profile(
+                with_flops=True
+        ) as p:
+            model_instance(input_data)
+        self.flops = int(p.profiler.function_events.total_average().flops)
+        self.flops = None
+        if prev_flops is None:
+            self.flop_change_ratio = 0.0
+        else:
+            assert isinstance(prev_flops, int)
+            assert self.flops > 0 and prev_flops > 0
+            self.flop_change_ratio = float(self.flops / prev_flops) - 1
 
     @property
     def state(self):
@@ -184,6 +197,12 @@ class NasModel:
         #     self.train_times = 0
         self.logger.info(f'create model {self.index} from {self.prev_index}, structure: {self.model_config}')
 
+    def update_pool_state(self, in_pool: bool):
+        if in_pool:
+            update_new_pool_state(self.cfg, self.index, 1)
+        else:
+            update_new_pool_state(self.cfg, self.index, 0)
+
     def __call__(self, x):
         return self.model_instance(x)
 
@@ -198,7 +217,7 @@ class NasModel:
         :return: None
         """
         optimizer = self._get_optimizer()
-        scheduler = torch.optim.lr_scheduler.ExponentialLR(optimizer, 0.995, self.train_times)
+        # scheduler = torch.optim.lr_scheduler.ExponentialLR(optimizer, 0.995, self.train_times)
         loss_fn = self._get_loss_function()
         dataloader = DataLoader(TensorDataset(X_train, y_train),
                                 self.cfg.NASConfig['BATCH_SIZE'],
@@ -222,7 +241,7 @@ class NasModel:
                 optimizer.zero_grad()
                 loss.backward()
                 optimizer.step()
-                scheduler.step()
+                # scheduler.step()
                 loss_list.append(loss.item())
             # self.model_instance = model_save
             self.train_times += 1
@@ -294,9 +313,10 @@ class NasModel:
             i += 1
         module_instances = [*module_instances, *model_config.tail_layers]
         model_instance = torch.nn.Sequential(*module_instances)
-        m = NasModel(self.cfg, model_instance, model_config, self.train_times, self.index)
+        m = NasModel(self.cfg, model_instance, model_config, self.train_times, self.index, self.flops)
         m.transformation_record = self.transformation_record.copy()
         m.add_transformation_record(self.index, m.index, self.train_times, self.loss_list)
+        m.transitions = self.transitions.copy()
         return m
 
     def perform_deeper_transformation(self, deeper_action):
@@ -335,9 +355,10 @@ class NasModel:
 
         module_instances = [*module_instances, *model_config.tail_layers]
         model_instance = torch.nn.Sequential(*module_instances)
-        m = NasModel(self.cfg, model_instance, model_config, self.train_times, self.index)
+        m = NasModel(self.cfg, model_instance, model_config, self.train_times, self.index, self.flops)
         m.transformation_record = self.transformation_record.copy()
         m.add_transformation_record(self.index, m.index, self.train_times, self.loss_list)
+        m.transitions = self.transitions.copy()
         return m
 
     def save_pred_result(self, X_test, y_test, model_dir=None):
@@ -404,7 +425,7 @@ class NasModel:
             f.write(str(self.model_config))
         pd.DataFrame(self.loss_list).to_csv(loss_path)
         self.transformation_record.to_csv(model_transformation_path)
-        insert_new_train_result(self.cfg, self.index, self.train_times, self.test_loss_best)
+        update_new_train_result(self.cfg, self.index, self.train_times, self.test_loss_best)
 
     def prune(self):
         """
@@ -445,9 +466,10 @@ class NasModel:
             module_instances.append(self.activate())
         module_instances = [*module_instances, *model_config.tail_layers]
         model_instance = torch.nn.Sequential(*module_instances)
-        m = NasModel(self.cfg, model_instance, model_config, self.train_times, self.index)
+        m = NasModel(self.cfg, model_instance, model_config, self.train_times, self.index, self.flops)
         m.transformation_record = self.transformation_record.copy()
         m.add_transformation_record(self.index, m.index, self.train_times, self.loss_list)
+        m.transitions = self.transitions.copy()
         return m
 
     def _get_loss_function(self):
@@ -457,8 +479,9 @@ class NasModel:
         if self.optimizer is not None:
             return self.optimizer
 
-        self.optimizer = torch.optim.Adam([{'params': self.model_instance.parameters(),
-                                            'initial_lr': 1e-3}], weight_decay=1e-4)
+        # self.optimizer = torch.optim.Adam([{'params': self.model_instance.parameters(),
+        #                                     'initial_lr': 1e-3}], weight_decay=1e-4)
+        self.optimizer = torch.optim.Adam(self.model_instance.parameters())
         return self.optimizer
 
     @staticmethod

@@ -1,3 +1,6 @@
+import os
+import pickle
+
 from torch.optim import Adam
 
 from .components import *
@@ -20,9 +23,11 @@ class Agent:
         self.wider_net = WinderActorNet(self.cfg, hidden_size * 2)
         self.deeper_net = DeeperActorNet(self.cfg, hidden_size * 2, max_layers)
         self.selector_net = SelectorActorNet(self.cfg, hidden_size * 2)
-        self.selector_optimizer = Adam(self.selector_net.parameters(), weight_decay=1e-4)
-        self.wider_optimizer = Adam(self.wider_net.parameters(), weight_decay=1e-4)
-        self.deeper_optimizer = Adam(self.deeper_net.parameters(), weight_decay=1e-4)
+        weight_decay = 1e-8
+        self.selector_optimizer = Adam(self.selector_net.parameters(), weight_decay=weight_decay)
+        self.wider_optimizer = Adam(self.wider_net.parameters(), weight_decay=weight_decay)
+        self.deeper_optimizer = Adam(self.deeper_net.parameters(), weight_decay=weight_decay)
+        self.encoder_optimizer = Adam(self.encoder_net.parameters(), weight_decay=weight_decay)
         self.Categorical = torch.distributions.Categorical
         self.entropy_weight = 0.0001
         self.discount = 0.99
@@ -93,6 +98,7 @@ class Agent:
 
         if self.cfg.NASConfig['GPU']:
             self.to_cuda()
+        loss = 0
         for trajectory in trajectories:
             # calculate immediate net output todo finish new agent update algorithm
             states = [i.state for i in trajectory]
@@ -103,36 +109,39 @@ class Agent:
 
             # update selector net
             # (do nothing, wider, deeper, prune)
-            print('update start')
-            self._update_selector(self.selector_optimizer,
-                                  [i['select'] for i in actions],
-                                  [i['select'] for i in new_actions['policy']],
-                                  [i['select'] for i in old_policies],
-                                  [i['select'] for i in new_actions['Q']],
-                                  [i['select'] for i in new_actions['V']],
-                                  rewards)
+            # print('update start')
+            loss += self._update_selector(self.selector_optimizer,
+                                          [i['select'] for i in actions],
+                                          [i['select'] for i in new_actions['policy']],
+                                          [i['select'] for i in old_policies],
+                                          [i['select'] for i in new_actions['Q']],
+                                          [i['select'] for i in new_actions['V']],
+                                          rewards)
 
             # update wider net select == 1
-            self._update_wider(self.wider_optimizer,
-                               [i['wider'] for i in actions],
-                               [i['wider'] for i in new_actions['policy']],
-                               [i['wider'] for i in old_policies],
-                               [i['wider'] for i in new_actions['Q']],
-                               [i['wider'] for i in new_actions['V']],
-                               rewards,
-                               states,
-                               [i['select'] for i in actions])
+            loss += self._update_wider(self.wider_optimizer,
+                                       [i['wider'] for i in actions],
+                                       [i['wider'] for i in new_actions['policy']],
+                                       [i['wider'] for i in old_policies],
+                                       [i['wider'] for i in new_actions['Q']],
+                                       [i['wider'] for i in new_actions['V']],
+                                       rewards,
+                                       states,
+                                       [i['select'] for i in actions])
 
             # update deeper net select == 2
-            self._update_deeper(self.deeper_optimizer,
-                                [i['deeper'] for i in actions],
-                                [i['deeper'] for i in new_actions['policy']],
-                                [i['deeper'] for i in old_policies],
-                                [i['deeper'] for i in new_actions['Q']],
-                                [i['deeper'] for i in new_actions['V']],
-                                rewards,
-                                states,
-                                [i['select'] for i in actions])
+            loss += self._update_deeper(self.deeper_optimizer,
+                                        [i['deeper'] for i in actions],
+                                        [i['deeper'] for i in new_actions['policy']],
+                                        [i['deeper'] for i in old_policies],
+                                        [i['deeper'] for i in new_actions['Q']],
+                                        [i['deeper'] for i in new_actions['V']],
+                                        rewards,
+                                        states,
+                                        [i['select'] for i in actions])
+            # update encoder net
+            self._step_optimizer(self.encoder_optimizer)
+        return loss
 
     def _calculate_loss(self, actions, policies, old_policies, Qs, Vs, rewards):
         """
@@ -143,15 +152,16 @@ class Agent:
         :param rewards: reward information to update
         :return loss value
         """
-        action_size = policies[0].size(0)
         policy_loss, value_loss = torch.zeros(1, device=Vs[0].device), torch.zeros(1, device=Vs[0].device)
         t = len(rewards)
         if t == 0:  # return if no trajectory
             return
         Qret = torch.zeros(1, device=Vs[0].device)
         for i in reversed(range(t)):
-            # Importance sampling weights ρ ← π(∙|s_i) / µ(∙|s_i)  todo stop here
-            rho = policies[i].detach() / old_policies[i]
+            # avoid zero or negative values
+            policies[i] = policies[i].clamp(min=1e-10)
+            # Importance sampling weights ρ ← π(∙|s_i) / µ(∙|s_i)
+            rho = policies[i].detach() / (old_policies[i] + 1e-5)
             # Qret ← r_i + γQret
             Qret = rewards[i] + self.discount * Qret
             # Advantage A ← Qret - V(s_i; θ)
@@ -162,7 +172,7 @@ class Agent:
             single_step_policy_loss = - rho[actions[i]].clamp(max=self.rho_max) * log_prob * A.detach()
             # bias correction
             # g ← g + Σ_a [1 - c/ρ_a]_+∙π(a|s_i; θ)∙∇θ∙log(π(a|s_i; θ))∙(Q(s_i, a; θ) - V(s_i; θ)
-            single_step_policy_loss -= ((1 - self.rho_max / rho).clamp(min=0) * policies[i].log() * (
+            single_step_policy_loss -= ((1 - self.rho_max / (rho + 1e-5)).clamp(min=0) * policies[i].log() * (
                     Qs[i].detach() - Vs[i].expand_as(Qs[i]).detach())).sum()
             # Policy update dθ ← dθ + ∂θ/∂θ∙g
             policy_loss += single_step_policy_loss
@@ -180,23 +190,28 @@ class Agent:
         loss = policy_loss + value_loss
         return loss
 
-    def _step_optimizer(self, optimizer, loss):
+    def _backward_step_optimizer(self, optimizer, loss):
         optimizer.zero_grad()
         loss.backward(retain_graph=True)
-        norm = torch.nn.utils.clip_grad_norm_(optimizer.param_groups[0]['params'], 100, error_if_nonfinite=True)
-        print(f'norm:{norm.item()}')
+        self._step_optimizer(optimizer)
+        return loss.item()
+
+    def _step_optimizer(self, optimizer):
+        torch.nn.utils.clip_grad_value_(optimizer.param_groups[0]['params'], 1e5)  # avoid nan value
+        torch.nn.utils.clip_grad_norm_(optimizer.param_groups[0]['params'], 100, error_if_nonfinite=False)
         optimizer.step()
+        optimizer.zero_grad()
 
     def _update_selector(self, optimizer, actions, policies, old_policies, Qs, Vs, rewards):
         loss = self._calculate_loss(actions, policies, old_policies, Qs, Vs, rewards)
-        self._step_optimizer(optimizer, loss)
+        return self._backward_step_optimizer(optimizer, loss)
 
     def _update_wider(self, optimizer, actions, policies, old_policies, Qs, Vs, rewards, states, selected_ops):
         wider_ops = torch.tensor(selected_ops) == SelectorActorNet.WIDER
-        if wider_ops.any():
+        if wider_ops.any().item():
             actions_, policies_, old_policies_, Qs_, Vs_, rewards_ = [], [], [], [], [], []
             for i in range(len(wider_ops)):
-                if wider_ops[i]:
+                if wider_ops[i].item():
                     editable_list = states[i][2]
                     actions_.append(actions[i])
                     policies_.append(policies[i][editable_list])
@@ -205,11 +220,12 @@ class Agent:
                     Vs_.append(Vs[i])
                     rewards_.append(rewards[i])
             loss = self._calculate_loss(actions_, policies_, old_policies_, Qs_, Vs_, rewards_)
-            self._step_optimizer(optimizer, loss)
+            return self._backward_step_optimizer(optimizer, loss)
+        return 0
 
     def _update_deeper(self, optimizer, actions, policies, old_policies, Qs, Vs, rewards, states, selected_ops):
         deeper_ops = torch.tensor(selected_ops) == SelectorActorNet.DEEPER
-        if deeper_ops.any():
+        if deeper_ops.any().item():
             loss_type = self._calculate_loss(  # type
                 [i[0] for i in actions],
                 [i[0] for i in policies],
@@ -225,7 +241,23 @@ class Agent:
                 [i[1] for i in Vs],
                 rewards)
             loss = loss_type + loss_index
-            self._step_optimizer(optimizer, loss)
+            return self._backward_step_optimizer(optimizer, loss)
+        return 0
+
+    def save(self, path=None):
+        path = os.path.join(self.cfg.NASConfig['OUT_DIR'], 'agent.pkl') if path is None else path
+        with open(path, 'wb') as f:
+            pickle.dump(self, f)
+
+    @staticmethod
+    def try_load(cfg, logger, path=None):
+        path = os.path.join(cfg.NASConfig['OUT_DIR'], 'agent.pkl') if path is None else path
+        if not os.path.exists(path):
+            return None
+        with open(path, 'rb') as f:
+            agent = pickle.load(f)
+            logger.critical('load agent checkpoint')
+            return agent
 
 
 def action_describe(cfg, action):
