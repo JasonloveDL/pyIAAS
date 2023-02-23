@@ -1,5 +1,6 @@
 import os.path
 import pickle
+from ctypes import Union
 
 import numpy as np
 import pandas as pd
@@ -93,7 +94,6 @@ def train_test_split(x, y, test_ratio_or_size):
     :return: X_train, y_train, X_test, y_test
     """
     length = x.shape[0]
-    train_length = int(length * (1 - test_ratio_or_size)) if isinstance(test_ratio_or_size,
-                                                                        float) else length - test_ratio_or_size
+    train_length = int(length * (1 - test_ratio_or_size)) if isinstance(test_ratio_or_size, float) else length - test_ratio_or_size
     X_train, y_train, X_test, y_test = x[:train_length], y[:train_length], x[train_length:], y[train_length:]
     return X_train, y_train, X_test, y_test

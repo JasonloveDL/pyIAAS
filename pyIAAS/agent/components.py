@@ -159,6 +159,7 @@ class DeeperActorNet(Module):
             Linear(_hidden_size, max_layers),
         )
 
+
     def get_action(self, hn_feature: torch.Tensor, insert_length: int):
         """
         get output of deeper actor network

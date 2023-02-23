@@ -1,5 +1,6 @@
+import pickle
+
 from pyIAAS import *
-from pyIAAS import Config
 
 
 def set_seed(seed):
@@ -35,11 +36,12 @@ def try_load_rng_state(cfg, logger, path=None):
     path = os.path.join(cfg.NASConfig['OUT_DIR'], 'rng_state.pkl') if path is None else path
     if not os.path.exists(path):
         return None
-    with open(path, 'rb') as f:
+    with open(path,'rb') as f:
         cpu_state, gpu_states = pickle.load(f)
         torch.set_rng_state(cpu_state)
         torch.cuda.set_rng_state_all(gpu_states)
         logger.critical(f'load cpu and gpu rng state')
+
 
 
 def run_search(config, input_file, target_name, test_ratio):

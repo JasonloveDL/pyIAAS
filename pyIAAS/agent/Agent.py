@@ -246,7 +246,7 @@ class Agent:
 
     def save(self, path=None):
         path = os.path.join(self.cfg.NASConfig['OUT_DIR'], 'agent.pkl') if path is None else path
-        with open(path, 'wb') as f:
+        with open(path,'wb') as f:
             pickle.dump(self, f)
 
     @staticmethod
@@ -254,10 +254,13 @@ class Agent:
         path = os.path.join(cfg.NASConfig['OUT_DIR'], 'agent.pkl') if path is None else path
         if not os.path.exists(path):
             return None
-        with open(path, 'rb') as f:
+        with open(path,'rb') as f:
             agent = pickle.load(f)
+            agent.cfg = cfg
             logger.critical('load agent checkpoint')
             return agent
+
+
 
 
 def action_describe(cfg, action):

@@ -91,8 +91,7 @@ class ModelConfig:
 
 
 class NasModel:
-    def __init__(self, cfg, model_instance: torch.nn.Module, model_config: ModelConfig, train_times=0, prev_index=-1,
-                 prev_flops=None):
+    def __init__(self, cfg, model_instance: torch.nn.Module, model_config: ModelConfig, train_times=0, prev_index=-1, prev_flops = None):
         """
         NAS model class, this class representing running instance of a neural network and we can do wider and deeper transformation
         in this class
@@ -118,19 +117,20 @@ class NasModel:
         self.transitions = []
         self.optimizer = None
         self.activate = activate
-        input_data = torch.zeros((1, *model_config.feature_shape))
-        with torch.profiler.profile(
-                with_flops=True
-        ) as p:
-            model_instance(input_data)
-        self.flops = int(p.profiler.function_events.total_average().flops)
         self.flops = None
-        if prev_flops is None:
-            self.flop_change_ratio = 0.0
-        else:
-            assert isinstance(prev_flops, int)
-            assert self.flops > 0 and prev_flops > 0
-            self.flop_change_ratio = float(self.flops / prev_flops) - 1
+        # input_data = torch.zeros((1, *model_config.feature_shape))
+        # with torch.profiler.profile(
+        #     with_flops=True
+        # ) as p:
+        #     model_instance(input_data)
+        # self.flops = int(p.profiler.function_events.total_average().flops)
+        # if prev_flops is None:
+        #     self.flop_change_ratio = 0.0
+        # else:
+        #     assert isinstance(prev_flops, int)
+        #     assert self.flops > 0 and prev_flops > 0
+        #     self.flop_change_ratio = float(self.flops / prev_flops) - 1
+
 
     @property
     def state(self):
@@ -197,7 +197,7 @@ class NasModel:
         #     self.train_times = 0
         self.logger.info(f'create model {self.index} from {self.prev_index}, structure: {self.model_config}')
 
-    def update_pool_state(self, in_pool: bool):
+    def update_pool_state(self, in_pool:bool):
         if in_pool:
             update_new_pool_state(self.cfg, self.index, 1)
         else:
@@ -233,9 +233,10 @@ class NasModel:
             loss_list = []
             # model_save = self.model_instance todo may use torchscript in the future
             # self.model_instance = torch.jit.script(self.model_instance)
+            target_shape = y_train.shape
             for step, (batch_x, batch_y) in enumerate(dataloader):
                 pred = self.model_instance(batch_x)
-                pred = pred.view(-1)
+                pred = pred.view(batch_y.shape)
                 loss = loss_fn(pred, batch_y)
                 # Backpropagation
                 optimizer.zero_grad()
@@ -262,8 +263,9 @@ class NasModel:
         :param y_test: target value
         """
         with torch.no_grad():
-            loss_fn = self.rmse
+            loss_fn = self._get_loss_function()
             pred = self.model_instance(X_test).view(-1)
+            pred = pred.view(y_test.shape)
             loss = loss_fn(pred, y_test)
             self.test_loss = loss.item()
             self.next_save = False
@@ -473,7 +475,16 @@ class NasModel:
         return m
 
     def _get_loss_function(self):
-        return self.rmse
+        # default rmse loss function
+        loss_fn = self.rmse
+        if 'LossFunction' in self.cfg.NASConfig:
+            if self.cfg.NASConfig['LossFunction'] == "rmse":
+                loss_fn = self.rmse
+            elif self.cfg.NASConfig['LossFunction'] == "max_rmse":
+                loss_fn = self.max_rmse
+            elif self.cfg.NASConfig['LossFunction'] == "mix_rmse":
+                loss_fn = self.mix_rmse
+        return loss_fn
 
     def _get_optimizer(self):
         if self.optimizer is not None:
@@ -497,8 +508,20 @@ class NasModel:
         import torch.nn.functional as F
         return torch.sqrt(F.mse_loss(pred, truth))
 
+    @staticmethod
+    def max_rmse(pred, truth):
+        import torch.nn.functional as F
+        target_shape = pred.shape[1]
+        rmse = [torch.sqrt(F.mse_loss(pred[:,i], truth[:,i])) for i in range(target_shape)]
+        max_rmse = max(rmse)
+        return max_rmse
 
-def generate_new_model_config(cfg, feature_shape, targe_shape, skeleton=None) -> ModelConfig:
+    @staticmethod
+    def mix_rmse(pred, truth):
+        return NasModel.rmse(pred, truth) + NasModel.max_rmse(pred, truth)
+
+
+def generate_new_model_config(cfg, feature_shape, targe_shape, skeleton=None, max_width=None) -> ModelConfig:
     """
     generate random NasModel from scratch
     :return: ModelConfig of new NasModel
@@ -508,7 +531,7 @@ def generate_new_model_config(cfg, feature_shape, targe_shape, skeleton=None) ->
         maxLayers = cfg.NASConfig['MaxInitLayers']
         layers = np.random.randint(1, maxLayers + 1)
         skeleton = [j[0] for j in [random.sample(cfg.modulesList, 1) for i in range(layers)]]
-    modules = generate_from_skeleton(cfg, skeleton, feature_shape)
+    modules = generate_from_skeleton(cfg, skeleton, feature_shape, max_width)
     # generate NasModel train operations
     config = ModelConfig(cfg, modules, feature_shape, targe_shape)
     return config

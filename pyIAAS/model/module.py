@@ -1,6 +1,7 @@
 import abc
 import math
 import random
+from typing import Iterator
 
 import torch
 import torch.autograd as autograd
@@ -59,18 +60,22 @@ class NasModule(nn.Module):
         else:
             return min(valid_range)
 
-    def get_level(self, level_list) -> int:
+    def get_level(self, level_list, max_width) -> int:
         """
         determine init level, return random level
+        :param max_width:
         :param level_list: all available level list
         :return: level
         """
+        if max_width is not None:
+            level_list = [i for i in level_list if i <= max_width]
         return random.sample(level_list, 1)[0]
 
     @abc.abstractmethod
-    def init_param(self, input_shape):
+    def init_param(self, input_shape, max_width):
         """
         initialize parameters of this module
+        :param max_width: max width of neural layer
         :return: None
         """
         pass
@@ -189,11 +194,11 @@ class RNNModule(NasModule):
         out_range = self.cfg.modulesConfig['rnn']['out_range']
         return self.current_level >= max(out_range)
 
-    def init_param(self, input_shape):
+    def init_param(self, input_shape, max_width):
         assert len(input_shape) == 2
         self.params = dict()
         out_range = self.cfg.modulesConfig['rnn']['out_range']
-        self.current_level = self.get_level(out_range)
+        self.current_level = self.get_level(out_range, max_width)
         self.params['input_size'] = input_shape[1]
         self.params['output_size'] = self.current_level
         # get output shape
@@ -441,11 +446,11 @@ class DenseModule(NasModule):
         out_range = self.cfg.modulesConfig['dense']['out_range']
         return self.current_level >= max(out_range)
 
-    def init_param(self, input_shape):
+    def init_param(self, input_shape, max_width):
         assert len(input_shape) == 2
         out_range = self.cfg.modulesConfig['dense']['out_range']
         in_features = input_shape[1]
-        self.current_level = self.get_level(out_range)
+        self.current_level = self.get_level(out_range, max_width)
         self.params = {'in_features': in_features,
                        "out_features": self.current_level}
         self.on_param_end(input_shape)
@@ -567,11 +572,11 @@ class ConvModule(NasModule):
         out_range = self.cfg.modulesConfig['conv']['out_range']
         return self.current_level >= max(out_range)
 
-    def init_param(self, input_shape):
+    def init_param(self, input_shape, max_width):
         assert len(input_shape) == 2
         self.params = {'in_channels': input_shape[1]}
         out_range = self.cfg.modulesConfig['conv']['out_range']
-        self.current_level = self.get_level(out_range)
+        self.current_level = self.get_level(out_range, max_width)
         self.params['out_channels'] = self.current_level
         self.params['kernel_size'] = 3
         self.params['stride'] = 1
@@ -727,11 +732,11 @@ class LSTMModule(NasModule):
         return self.current_level >= max(out_range)
 
 
-    def init_param(self, input_shape):
+    def init_param(self, input_shape, max_width):
         assert len(input_shape) == 2
         self.params = dict()
         out_range = self.cfg.modulesConfig['lstm']['out_range']
-        self.current_level = self.get_level(out_range)
+        self.current_level = self.get_level(out_range, max_width)
         self.params['input_size'] = input_shape[1]
         self.params['output_size'] = self.current_level
         self.on_param_end(input_shape)
@@ -1004,19 +1009,20 @@ def generate_module(cfg, name, input_shape) -> NasModule:
         raise RuntimeError(f'no such module {name}, please if the module is not registered')
 
 
-def generate_from_skeleton(cfg, skeleton: list, input_shape):
+def generate_from_skeleton(cfg, skeleton: list, input_shape, max_width):
     """
     generate a list of module instance from skeleton list
     :param cfg: global configuration
     :param skeleton: skeleton list of string specifying each layer's type
     :param input_shape: input data shape
+    :param max_width: max width of neural layer
     :return: list of modules
     """
     modules = []
     for name in skeleton + ['dense']:
         module = generate_module(cfg, name, input_shape)
         try:
-            module.init_param(input_shape)
+            module.init_param(input_shape, max_width)
             input_shape = module.output_shape
             modules.append(module)
         except Exception as e:

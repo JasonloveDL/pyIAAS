@@ -6,6 +6,7 @@ from typing import Any, List
 
 import gym
 import numpy as np
+import torch
 
 from ..agent import SelectorActorNet, Transition, recursive_tensor_detach
 from ..model import generate_new_model_config, reset_model_count, NasModel
@@ -29,6 +30,11 @@ class NasEnv(gym.Env):
         self.pool_size = pool_size
         self.best_performance = 1e9  # record best performance
         self.global_train_times = 0
+        X_train, y_train, X_test, y_test = self.train_test_data
+        self.feature_shape = X_train.shape[1:]
+        assert len(y_train.shape) ==1 or len(y_train.shape) == 2, 'target data shape should be 1 dim or 2 dim'
+        self.target_shape = 1 if len(y_train.shape) == 1 else y_train.shape[1]
+
         if self.cfg.NASConfig['GPU']:
             self.train_test_data = []
             for i in range(len(train_test_data)):
@@ -50,36 +56,40 @@ class NasEnv(gym.Env):
 
         for i in range(len(self.net_pool)):
             net = self.net_pool[i]
-            if net.train_times >= self.cfg.NASConfig['MaxTrainTimes']:
-                # done
-                # record nothing
-                continue
+            # if net.train_times >= self.cfg.NASConfig['MaxTrainTimes']:
+            #     # done
+            #     # record nothing
+            #     continue
             action_i = action['action'][i]
             select = action_i['select']
             prev_net = net
 
             # add prev net
-            net_pool.append(prev_net)
-            transition_item = {}
-            transition_item['prev net'] = prev_net
-            transition_item['next net'] = prev_net
-            transition_item['action'] = copy.deepcopy(action['action'][i])
-            transition_item['action']['select'] = SelectorActorNet.UNCHANGE
-            transition_item['policy'] = action['policy'][i]
-            transition.append(transition_item)
+            if self.cfg.NASConfig['KeepPrevNet']:
+                net_pool.append(prev_net)
+                transition_item = {}
+                transition_item['prev net'] = prev_net
+                transition_item['next net'] = prev_net
+                transition_item['action'] = copy.deepcopy(action['action'][i])
+                transition_item['action']['select'] = SelectorActorNet.UNCHANGE
+                transition_item['policy'] = action['policy'][i]
+                transition.append(transition_item)
 
             # select representations
             if select == SelectorActorNet.UNCHANGE:  # do nothing
                 self.logger.info(f"net index {i}-{net.index} :do not change network {net}")
-                continue
+                if self.cfg.NASConfig['KeepPrevNet']:
+                    continue
             elif select == SelectorActorNet.WIDER:  # wider the net
                 self.logger.info(f"net index {i}-{net.index} :wider the net {net}")
                 net = net.perform_wider_transformation(action_i['wider'])
             elif select == SelectorActorNet.DEEPER:  # deeper the net
-                self.logger.info(f"net index {i}-{net.index} :deeper the net {net}")
-                net = net.perform_deeper_transformation(action_i['deeper'])
-                if len(net.model_config.modules) > self.cfg.NASConfig['MaxLayers']:  # constrain the network's depth
-                    continue
+                if len(net.model_config.modules) < self.cfg.NASConfig['MaxLayers']:  # constrain the network's depth
+                    self.logger.info(f"net index {i}-{net.index} :deeper the net {net}")
+                    net = net.perform_deeper_transformation(action_i['deeper'])
+                else:
+                    if self.cfg.NASConfig['KeepPrevNet']:
+                        continue
             elif select == SelectorActorNet.PRUNE:  # prune the net
                 self.logger.info(f"net index {i}-{net.index} :prune the net {net}")
                 net = net.prune()
@@ -95,11 +105,8 @@ class NasEnv(gym.Env):
         self.net_pool = net_pool
         for net in self.net_pool:
             net.update_pool_state(True)
-        X_train, y_train, X_test, y_test = self.train_test_data
-        feature_shape = X_train.shape[1:]
-        base_structure = [[i] for i in self.cfg.modulesList]
-        skeleton = random.sample(base_structure, 1)[0]
-        self.net_pool.append(generate_new_model_config(self.cfg, feature_shape, 1, skeleton).generate_model())
+        random_nets = self.generate_random_net()
+        self.net_pool.extend(random_nets)
         self.net_pool = list(set(self.net_pool))
         self._train_and_test()
         self.net_pool = sorted(self.net_pool, key=lambda x: x.test_loss)
@@ -140,8 +147,11 @@ class NasEnv(gym.Env):
         """
         reward_dict = {}
         for net in self.net_pool:
-            reward_dict[net] = (1 / net.test_loss) * (
-                        1 - self.cfg.NASConfig['RewardRegularisation'] * net.flop_change_ratio)
+            regularize_layer_number = self.cfg.NASConfig['RewardRegularisationLayers'] * max(0, len(net.model_config.modules) -
+                                                                           self.cfg.NASConfig['LayerNumberStartRegularize'])
+            regularize_layer_width = self.cfg.NASConfig['RewardRegularisationWidth'] * max(0, max(i.current_level for i in net.model_config.modules) -
+                                                                           self.cfg.NASConfig['LayerWidthStartRegularize'])
+            reward_dict[net] = (1 / net.test_loss) - regularize_layer_number - regularize_layer_width
         return reward_dict
 
     def reset(self):
@@ -152,15 +162,14 @@ class NasEnv(gym.Env):
         """
         reset_model_count()
         X_train, y_train, X_test, y_test = self.train_test_data
-        feature_shape = X_train.shape[1:]
-        self.net_pool = [generate_new_model_config(self.cfg, feature_shape, 1, [i]).generate_model() for i in
-                         self.cfg.modulesConfig.keys()]
+        self.net_pool = [generate_new_model_config(self.cfg, self.feature_shape, self.target_shape, [i]).generate_model() for i in self.cfg.modulesConfig.keys()]
         self._train_and_test()
         self.render()
         return self.get_state()
 
     def get_state(self):
         return [i.state for i in self.net_pool]
+
 
     def render(self, mode='human'):
         """
@@ -199,7 +208,7 @@ class NasEnv(gym.Env):
 
     def save(self, path=None):
         path = os.path.join(self.cfg.NASConfig['OUT_DIR'], 'env.pkl') if path is None else path
-        with open(path, 'wb') as f:
+        with open(path,'wb') as f:
             pickle.dump(self, f)
 
     @staticmethod
@@ -207,7 +216,29 @@ class NasEnv(gym.Env):
         path = os.path.join(cfg.NASConfig['OUT_DIR'], 'env.pkl') if path is None else path
         if not os.path.exists(path):
             return None
-        with open(path, 'rb') as f:
+        with open(path,'rb') as f:
             env = pickle.load(f)
+            env.cfg = cfg
+            for n in env.net_pool:
+                n.cfg = cfg
+                n.model_config.cfg = cfg
             logger.critical('load env checkpoint')
             return env
+
+    def generate_random_net(self):
+        net_number = self.cfg.NASConfig['RandomAddNumber']
+        random_nets = []
+        # max_length = max(len(i.model_config.modules) for i in self.net_pool)
+        # max_width = max(max(j.current_level for j in i.model_config.modules) for i in self.net_pool)
+        for i in range(net_number):
+            # net_layers = min(max(1, int(random.expovariate(10/self.cfg.NASConfig['MaxLayers']))), max_length)
+            # skeleton = [random.sample(self.cfg.modulesCls.keys(), 1)[0] for i in range(net_layers)]
+            # random_model = generate_new_model_config(self.cfg, self.feature_shape, self.target_shape,
+            #                                          skeleton, max_width).generate_model()
+            # random_nets.append(random_model)
+            net_layers = min(max(1, int(random.expovariate(0.2))), self.cfg.NASConfig['MaxLayers'])
+            skeleton = [random.sample(self.cfg.modulesCls.keys(),1)[0] for i in range(net_layers)]
+            random_model = generate_new_model_config(self.cfg, self.feature_shape, self.target_shape, skeleton).generate_model()
+            random_nets.append(random_model)
+        return random_nets
+
